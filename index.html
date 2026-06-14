@@ -1,0 +1,1995 @@
+<!doctype html>
+<html lang="es-MX" class="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <title>Obras — Control financiero</title>
+  <meta name="theme-color" content="#4F46E5" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Obras" />
+
+  <!-- Tailwind (CDN, sin build) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: {
+        fontFamily: { sans: ['-apple-system','BlinkMacSystemFont','Segoe UI','Roboto','Helvetica','Arial','sans-serif'] },
+      } }
+    };
+  </script>
+
+  <!-- React + Babel + Chart.js (CDN) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+  <style>
+    :root { --safe-b: env(safe-area-inset-bottom, 0px); --safe-t: env(safe-area-inset-top, 0px); }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: #FAFAF8;
+      color: #16181D;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior-y: none;
+      font-variant-numeric: tabular-nums;
+    }
+    html.dark body { background: #0E0F13; color: #F3F4F6; }
+    .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+    /* scroll suave / ocultar scrollbars feos */
+    ::-webkit-scrollbar { width: 0; height: 0; }
+    .sheet-enter { animation: sheetUp .22s cubic-bezier(.2,.8,.2,1); }
+    @keyframes sheetUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+    .fade-in { animation: fade .18s ease; }
+    @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .sheet-enter, .fade-in { animation: none; }
+    }
+    canvas { max-width: 100%; }
+    input, select, textarea, button { font-family: inherit; }
+    .tabnums { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+/* ============================================================================
+   OBRAS — Control financiero por obra (PWA, Fase 1)
+   - Capa de datos abstraída (db) sobre IndexedDB (local-first, offline).
+   - Para migrar a Supabase en Fase 2: reemplazar SOLO el módulo `db`.
+     Las funciones ya son async, la UI no toca IndexedDB directamente.
+   ========================================================================== */
+
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+/* ----------------------------- Utilidades --------------------------------- */
+const uid = (p = "id") =>
+  p + "_" + ((crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : Math.random().toString(36).slice(2, 10))) + Date.now().toString(36).slice(-3);
+
+const mxn = new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN", minimumFractionDigits: 2 });
+const fmtMXN = (n) => mxn.format(Number(n) || 0);
+const fmtMXN0 = (n) => new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN", maximumFractionDigits: 0 }).format(Number(n) || 0);
+const fmtDate = (iso) => { if (!iso) return "—"; const d = new Date(iso + "T00:00:00"); return d.toLocaleDateString("es-MX", { day: "2-digit", month: "short", year: "numeric" }); };
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const isoFrom = (daysFromToday) => new Date(Date.now() + daysFromToday * 86400000).toISOString().slice(0, 10);
+const monthKey = (iso) => iso.slice(0, 7);
+const monthLabel = (key) => { const [y, m] = key.split("-"); return new Date(y, m - 1, 1).toLocaleDateString("es-MX", { month: "short", year: "2-digit" }); };
+
+const PROYECTO_COLORS = ["#4F46E5","#059669","#D97706","#DB2777","#0891B2","#7C3AED","#65A30D","#DC2626","#0D9488","#9333EA"];
+
+/* ---------------------- Exportar: CSV y nota PDF -------------------------- */
+function toCSV(rows) {
+  return rows.map((r) => r.map((x) => `"${String(x == null ? "" : x).replace(/"/g, '""')}"`).join(",")).join("\n");
+}
+function downloadFile(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+}
+function movsToRows(movs, data) {
+  const rows = [["Fecha", "Tipo", "Obra", "Proveedor", "Rubro", "Etapa", "Forma de pago", "Cuenta", "Estatus", "Monto", "Descripción"]];
+  movs.slice().sort((a, b) => a.fecha.localeCompare(b.fecha)).forEach((m) => {
+    const o = data.proyectos.find((x) => x.id === m.proyecto_id);
+    const p = data.proveedores.find((x) => x.id === m.proveedor_id);
+    const c = data.categorias.find((x) => x.id === m.categoria_id);
+    const cta = data.cuentas.find((x) => x.id === m.cuenta_id);
+    rows.push([m.fecha, m.tipo, o ? o.nombre : "", p ? p.nombre : "", c ? c.nombre : "", m.etapa || "", m.metodo_pago, cta ? cta.nombre : "", m.estatus, m.monto, (m.descripcion || "").replace(/[\n;]/g, " ")]);
+  });
+  return rows;
+}
+function exportMovsCSV(movs, data, nombreArchivo) {
+  downloadFile(nombreArchivo, "\ufeff" + toCSV(movsToRows(movs, data)), "text/csv;charset=utf-8;");
+}
+// Nota individual de un movimiento en PDF (recibo).
+function notaPDF(m, data) {
+  const jsPDF = window.jspdf && window.jspdf.jsPDF;
+  if (!jsPDF) { alert("No se pudo cargar el generador de PDF. Conéctate a internet una vez y vuelve a intentar."); return; }
+  const o = data.proyectos.find((x) => x.id === m.proyecto_id);
+  const p = data.proveedores.find((x) => x.id === m.proveedor_id);
+  const c = data.categorias.find((x) => x.id === m.categoria_id);
+  const cta = data.cuentas.find((x) => x.id === m.cuenta_id);
+  const esIngreso = m.tipo === "ingreso";
+  const doc = new jsPDF({ unit: "pt", format: "a5" }); // 420 x 595 pt
+  const W = 420, mx = 36;
+  let y = 54;
+  doc.setFont("helvetica", "bold"); doc.setFontSize(16);
+  doc.text(esIngreso ? "NOTA DE COBRO" : "NOTA DE PAGO", mx, y);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(120);
+  doc.text("Folio " + String(m.id).slice(-8).toUpperCase(), W - mx, y, { align: "right" });
+  y += 8; doc.setDrawColor(220); doc.line(mx, y, W - mx, y); y += 26;
+  // Monto destacado
+  doc.setTextColor(esIngreso ? 5 : 190, esIngreso ? 150 : 30, esIngreso ? 105 : 72);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(26);
+  doc.text(fmtMXN(m.monto), mx, y); y += 26;
+  doc.setTextColor(40); doc.setFontSize(10);
+  const rows = [
+    ["Fecha", fmtDate(m.fecha)],
+    ["Tipo", esIngreso ? "Ingreso (cobro)" : "Egreso (pago)"],
+    ["Obra / proyecto", o ? o.nombre : "—"],
+    ["Cliente", o ? (o.cliente || "—") : "—"],
+    [esIngreso ? "Etapa" : "Proveedor", esIngreso ? (m.etapa || "—") : (p ? p.nombre : "—")],
+  ];
+  if (!esIngreso) { rows.push(["Concepto / rubro", c ? c.nombre : "—"]); rows.push(["Etapa", m.etapa || "—"]); }
+  rows.push(["Forma de pago", m.metodo_pago]);
+  rows.push(["Cuenta", cta ? cta.nombre : "—"]);
+  rows.push(["Estatus", m.estatus]);
+  if (m.descripcion) rows.push(["Nota", m.descripcion]);
+  doc.setFont("helvetica", "normal");
+  rows.forEach((r) => {
+    doc.setTextColor(130); doc.text(r[0], mx, y);
+    doc.setTextColor(30); doc.text(String(r[1]), mx + 120, y, { maxWidth: W - mx - (mx + 120) });
+    y += 20;
+  });
+  y += 14; doc.setDrawColor(230); doc.line(mx, y, W - mx, y); y += 18;
+  doc.setTextColor(150); doc.setFontSize(8);
+  doc.text("Generado por Obras · " + new Date().toLocaleString("es-MX"), mx, y);
+  doc.save(`nota_${m.tipo}_${m.fecha}_${String(m.id).slice(-6)}.pdf`);
+}
+
+// Comprime una imagen a JPEG/dataURL para guardarla ligera en IndexedDB.
+function fileToDataUrl(file, maxW = 1280, quality = 0.7) {
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const sc = Math.min(1, maxW / img.width);
+        const c = document.createElement("canvas");
+        c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+        try { res(c.toDataURL("image/jpeg", quality)); } catch (e) { res(fr.result); }
+      };
+      img.onerror = () => res(fr.result);
+      img.src = fr.result;
+    };
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+}
+
+// Nombre de cliente de una obra (entidad clientes, con respaldo al texto libre).
+function clienteNombre(obra, data) {
+  if (!obra) return "—";
+  const c = data.clientes && data.clientes.find((x) => x.id === obra.cliente_id);
+  return (c && c.nombre) || obra.cliente || "—";
+}
+
+// Flujo de caja proyectado: balance acumulado por semana sumando cobros y restando pagos programados pendientes.
+function buildCashflow(saldoInicial, pagos, cobros, semanas = 8) {
+  const pts = []; let bal = saldoInicial;
+  for (let w = 0; w < semanas; w++) {
+    const ini = isoFrom(w * 7), fin = isoFrom((w + 1) * 7);
+    const inFlow = cobros.filter((c) => c.estatus === "pendiente" && c.fecha_vencimiento >= ini && c.fecha_vencimiento < fin).reduce((a, c) => a + (Number(c.monto) || 0), 0);
+    const outFlow = pagos.filter((p) => p.estatus === "pendiente" && p.fecha_vencimiento >= ini && p.fecha_vencimiento < fin).reduce((a, p) => a + (Number(p.monto) || 0), 0);
+    bal += inFlow - outFlow;
+    pts.push({ label: "Sem " + (w + 1), balance: Math.round(bal), inFlow, outFlow });
+  }
+  return pts;
+}
+
+/* ===========================================================================
+   MÓDULO db  — IndexedDB. Única capa que tocaría Supabase en Fase 2.
+   =========================================================================== */
+const db = (() => {
+  const DB_NAME = "obras_db";
+  const DB_VERSION = 2;
+  const STORES = ["proyectos","partidas","movimientos","proveedores","categorias","cuentas","pagos_programados","carpetas","clientes","cobros_programados","adjuntos"];
+  let _db = null;
+
+  function open() {
+    return new Promise((resolve, reject) => {
+      const r = indexedDB.open(DB_NAME, DB_VERSION);
+      r.onupgradeneeded = (e) => {
+        const d = e.target.result;
+        STORES.forEach((s) => { if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: "id" }); });
+      };
+      r.onsuccess = () => { _db = r.result; resolve(_db); };
+      r.onerror = () => reject(r.error);
+    });
+  }
+  const reqP = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  async function store(name, mode) { const d = _db || (await open()); return d.transaction(name, mode).objectStore(name); }
+  async function _all(s) { return reqP((await store(s, "readonly")).getAll()); }
+  async function _put(s, o) { await reqP((await store(s, "readwrite")).put(o)); return o; }
+  async function _del(s, id) { await reqP((await store(s, "readwrite")).delete(id)); return id; }
+  async function _bulk(s, arr) { const os = await store(s, "readwrite"); for (const o of arr) await reqP(os.put(o)); }
+  async function _clearAll() { for (const s of STORES) { const os = await store(s, "readwrite"); await reqP(os.clear()); } }
+
+  // ---- Catálogos base (se conservan; arrancan disponibles aunque la app esté en cero) ----
+  function buildCatalogs() {
+    const cuentas = [
+      { id: "acc_bbva", nombre: "BBVA", tipo: "banco", saldo_inicial: 0 },
+      { id: "acc_efe", nombre: "Efectivo", tipo: "efectivo", saldo_inicial: 0 },
+    ];
+    const categorias = [
+      { id: "cat_cobro", nombre: "Cobro a cliente", tipo: "ingreso", color: "#059669", icono: "💵" },
+      { id: "cat_carp", nombre: "Carpintería", tipo: "egreso", color: "#B45309", icono: "🔨" },
+      { id: "cat_pint", nombre: "Pintura", tipo: "egreso", color: "#2563EB", icono: "🎨" },
+      { id: "cat_elec", nombre: "Eléctrica", tipo: "egreso", color: "#CA8A04", icono: "⚡" },
+      { id: "cat_marm", nombre: "Mármol / Piso", tipo: "egreso", color: "#6B7280", icono: "🧱" },
+      { id: "cat_alum", nombre: "Aluminio / Cancelería", tipo: "egreso", color: "#0891B2", icono: "🪟" },
+      { id: "cat_tabl", nombre: "Tablaroca / Plafones", tipo: "egreso", color: "#7C3AED", icono: "🧰" },
+      { id: "cat_mueb", nombre: "Muebles", tipo: "egreso", color: "#DB2777", icono: "🛋️" },
+      { id: "cat_aire", nombre: "Aire acondicionado", tipo: "egreso", color: "#0D9488", icono: "❄️" },
+      { id: "cat_albn", nombre: "Albañilería", tipo: "egreso", color: "#9A3412", icono: "🧱" },
+      { id: "cat_mat",  nombre: "Material", tipo: "egreso", color: "#65A30D", icono: "📦" },
+    ];
+    const proveedores = [
+      { id: "p_humberto", nombre: "Humberto", telefono: "", contacto: "", email: "", notas: "Carpintería y muebles" },
+      { id: "p_jesus", nombre: "Jesús", telefono: "", contacto: "", email: "", notas: "Pintura" },
+      { id: "p_mario", nombre: "Mario", telefono: "", contacto: "", email: "", notas: "Eléctrica" },
+      { id: "p_cesar", nombre: "Cesar", telefono: "", contacto: "", email: "", notas: "Albañilería / piso" },
+      { id: "p_farid", nombre: "Farid", telefono: "", contacto: "", email: "", notas: "Aluminio / cancelería" },
+      { id: "p_norma", nombre: "Norma", telefono: "", contacto: "", email: "", notas: "Mármol" },
+      { id: "p_marco", nombre: "Marco Zaldívar", telefono: "", contacto: "", email: "", notas: "Aire acondicionado" },
+      { id: "p_harumi", nombre: "Harumi", telefono: "", contacto: "", email: "", notas: "Muebles" },
+      { id: "p_floren", nombre: "Florentino", telefono: "", contacto: "", email: "", notas: "Tablaroca" },
+    ];
+    return { cuentas, categorias, proveedores };
+  }
+
+  // ---- Datos de ejemplo (DEMO). Solo se cargan si el usuario los pide a propósito. ----
+  function buildExample() {
+    const carpetas = [{ id: "cf_jun", nombre: "Obras de junio", color: "#4F46E5", archivada: false, creado_en: isoFrom(-160) }];
+    const clientes = [
+      { id: "cl_bissu", nombre: "Familia Bissu", telefono: "", email: "", notas: "" },
+    ];
+    const proyectos = [
+      { id: "ob_bissu", nombre: "Familia Bissu", cliente: "Familia Bissu", cliente_id: "cl_bissu", carpeta_id: "cf_jun", color: "#4F46E5", estatus: "activo", total_contratado: 641172, honorarios: 112254, indirectos: 0, iva: 0, notas: "", creado_en: isoFrom(-150) },
+      { id: "ob_casa8", nombre: "Casa 8 / Pintura", cliente: "Casa 8", cliente_id: null, carpeta_id: "cf_jun", color: "#059669", estatus: "activo", total_contratado: 30343.85, honorarios: 3411.98, indirectos: 0, iva: 4185.36, notas: "", creado_en: isoFrom(-90) },
+      { id: "ob_casa7", nombre: "Casa 7 / A.A.", cliente: "Casa 7", cliente_id: null, carpeta_id: "cf_jun", color: "#D97706", estatus: "activo", total_contratado: 39045, honorarios: 0, indirectos: 0, iva: 0, notas: "", creado_en: isoFrom(-60) },
+    ];
+    const partidas = [
+      { id: "pa_b1", proyecto_id: "ob_bissu", proveedor_id: "p_cesar",  categoria_id: "cat_albn", concepto: "Desmantelamiento e hidrosanitaria", presupuesto: 148617 },
+      { id: "pa_b2", proyecto_id: "ob_bissu", proveedor_id: "p_floren", categoria_id: "cat_tabl", concepto: "Plafones y tablaroca", presupuesto: 55000 },
+      { id: "pa_b3", proyecto_id: "ob_bissu", proveedor_id: "p_mario",  categoria_id: "cat_elec", concepto: "Eléctrica", presupuesto: 164570 },
+      { id: "pa_b4", proyecto_id: "ob_bissu", proveedor_id: "p_norma",  categoria_id: "cat_marm", concepto: "Mármol", presupuesto: 93985 },
+      { id: "pa_b5", proyecto_id: "ob_bissu", proveedor_id: "p_farid",  categoria_id: "cat_alum", concepto: "Cancelería", presupuesto: 132418 },
+      { id: "pa_b6", proyecto_id: "ob_bissu", proveedor_id: "p_humberto", categoria_id: "cat_carp", concepto: "Puertas", presupuesto: 71200 },
+      { id: "pa_b7", proyecto_id: "ob_bissu", proveedor_id: "p_harumi", categoria_id: "cat_mueb", concepto: "Muebles", presupuesto: 55528.84 },
+      { id: "pa_c1", proyecto_id: "ob_casa8", proveedor_id: "p_jesus", categoria_id: "cat_pint", concepto: "Pintura", presupuesto: 11000 },
+      { id: "pa_c2", proyecto_id: "ob_casa8", proveedor_id: "p_jesus", categoria_id: "cat_mat",  concepto: "Compra de pintura", presupuesto: 4700.7 },
+      { id: "pa_d1", proyecto_id: "ob_casa7", proveedor_id: "p_marco", categoria_id: "cat_aire", concepto: "Aire acondicionado", presupuesto: 47103 },
+    ];
+    const mov = [];
+    const M = (o) => mov.push(Object.assign({ id: uid("mov"), metodo_pago: "transferencia", cuenta_id: "acc_bbva", estatus: "pagado", descripcion: "", creado_en: o.fecha }, o));
+    M({ fecha: isoFrom(-140), tipo: "ingreso", monto: 273000, proyecto_id: "ob_bissu", categoria_id: "cat_cobro", etapa: "anticipo", descripcion: "Anticipo cliente" });
+    M({ fecha: isoFrom(-70),  tipo: "ingreso", monto: 200000, proyecto_id: "ob_bissu", categoria_id: "cat_cobro", etapa: "avance", descripcion: "Avance 1" });
+    M({ fecha: isoFrom(-20),  tipo: "ingreso", monto: 100000, proyecto_id: "ob_bissu", categoria_id: "cat_cobro", etapa: "avance", descripcion: "Avance 2", metodo_pago: "efectivo", cuenta_id: "acc_efe" });
+    M({ fecha: isoFrom(-138), tipo: "egreso", monto: 60000, proyecto_id: "ob_bissu", partida_id: "pa_b1", proveedor_id: "p_cesar", categoria_id: "cat_albn", etapa: "anticipo", metodo_pago: "efectivo", cuenta_id: "acc_efe", descripcion: "Anticipo albañilería" });
+    M({ fecha: isoFrom(-100), tipo: "egreso", monto: 73000, proyecto_id: "ob_bissu", partida_id: "pa_b1", proveedor_id: "p_cesar", categoria_id: "cat_albn", etapa: "avance" });
+    M({ fecha: isoFrom(-90),  tipo: "egreso", monto: 52000, proyecto_id: "ob_bissu", partida_id: "pa_b2", proveedor_id: "p_floren", categoria_id: "cat_tabl", etapa: "finiquito" });
+    M({ fecha: isoFrom(-60),  tipo: "egreso", monto: 130000, proyecto_id: "ob_bissu", partida_id: "pa_b3", proveedor_id: "p_mario", categoria_id: "cat_elec", etapa: "avance" });
+    M({ fecha: isoFrom(-40),  tipo: "egreso", monto: 93846, proyecto_id: "ob_bissu", partida_id: "pa_b4", proveedor_id: "p_norma", categoria_id: "cat_marm", etapa: "finiquito" });
+    M({ fecha: isoFrom(-30),  tipo: "egreso", monto: 132418, proyecto_id: "ob_bissu", partida_id: "pa_b5", proveedor_id: "p_farid", categoria_id: "cat_alum", etapa: "finiquito" });
+    M({ fecha: isoFrom(-25),  tipo: "egreso", monto: 71200, proyecto_id: "ob_bissu", partida_id: "pa_b6", proveedor_id: "p_humberto", categoria_id: "cat_carp", etapa: "finiquito" });
+    M({ fecha: isoFrom(-80), tipo: "ingreso", monto: 21000, proyecto_id: "ob_casa8", categoria_id: "cat_cobro", etapa: "anticipo", descripcion: "Anticipo" });
+    M({ fecha: isoFrom(-75), tipo: "egreso", monto: 8000, proyecto_id: "ob_casa8", partida_id: "pa_c1", proveedor_id: "p_jesus", categoria_id: "cat_pint", etapa: "anticipo", metodo_pago: "efectivo", cuenta_id: "acc_efe" });
+    M({ fecha: isoFrom(-50), tipo: "egreso", monto: 7000, proyecto_id: "ob_casa8", partida_id: "pa_c1", proveedor_id: "p_jesus", categoria_id: "cat_pint", etapa: "avance", metodo_pago: "efectivo", cuenta_id: "acc_efe" });
+    M({ fecha: isoFrom(-48), tipo: "egreso", monto: 4180.7, proyecto_id: "ob_casa8", partida_id: "pa_c2", proveedor_id: "p_jesus", categoria_id: "cat_mat", descripcion: "Compra pintura", metodo_pago: "efectivo", cuenta_id: "acc_efe" });
+    M({ fecha: isoFrom(-55), tipo: "ingreso", monto: 27000, proyecto_id: "ob_casa7", categoria_id: "cat_cobro", etapa: "anticipo" });
+    M({ fecha: isoFrom(-52), tipo: "egreso", monto: 14500, proyecto_id: "ob_casa7", partida_id: "pa_d1", proveedor_id: "p_marco", categoria_id: "cat_aire", etapa: "anticipo" });
+    const pagos_programados = [
+      { id: "pp1", proyecto_id: "ob_bissu", partida_id: "pa_b3", proveedor_id: "p_mario", monto: 34570, fecha_vencimiento: isoFrom(-4), recurrencia: "unica", estatus: "pendiente", movimiento_id: null },
+      { id: "pp2", proyecto_id: "ob_bissu", partida_id: "pa_b7", proveedor_id: "p_harumi", monto: 55528.84, fecha_vencimiento: isoFrom(3), recurrencia: "unica", estatus: "pendiente", movimiento_id: null },
+      { id: "pp3", proyecto_id: "ob_casa7", partida_id: "pa_d1", proveedor_id: "p_marco", monto: 32603, fecha_vencimiento: isoFrom(18), recurrencia: "unica", estatus: "pendiente", movimiento_id: null },
+    ];
+    const cobros_programados = [
+      { id: "cp1", proyecto_id: "ob_bissu", cliente_id: "cl_bissu", etapa: "finiquito", monto: 68172, fecha_vencimiento: isoFrom(12), recurrencia: "unica", estatus: "pendiente", movimiento_id: null },
+      { id: "cp2", proyecto_id: "ob_casa8", cliente_id: null, etapa: "avance", monto: 9343, fecha_vencimiento: isoFrom(6), recurrencia: "unica", estatus: "pendiente", movimiento_id: null },
+    ];
+    return { carpetas, clientes, proyectos, partidas, movimientos: mov, pagos_programados, cobros_programados };
+  }
+
+  // Solo siembra catálogos si no existen. NUNCA crea obras/movimientos por su cuenta.
+  async function ensureSeed() {
+    const cats = await _all("categorias");
+    if (cats.length === 0) { const c = buildCatalogs(); for (const k of Object.keys(c)) await _bulk(k, c[k]); }
+  }
+  // Deja la app EN CERO: borra obras, partidas, movimientos, pagos, cobros, carpetas, clientes y adjuntos.
+  // Conserva catálogos: cuentas, categorías y proveedores.
+  async function resetZero() {
+    for (const s of ["proyectos","partidas","movimientos","pagos_programados","cobros_programados","carpetas","clientes","adjuntos"]) {
+      const os = await store(s, "readwrite"); await reqP(os.clear());
+    }
+    await ensureSeed();
+  }
+  // Carga los datos DEMO encima de los catálogos.
+  async function loadExample() {
+    await resetZero();
+    const e = buildExample();
+    for (const k of Object.keys(e)) await _bulk(k, e[k]);
+  }
+  async function wipe() { await _clearAll(); }
+
+  // ---- Respaldo / restauración (paracaídas hasta Supabase) ----
+  async function exportAll() {
+    const out = { __app: "obras", __version: DB_VERSION, __exported: new Date().toISOString(), data: {} };
+    for (const s of STORES) out.data[s] = await _all(s);
+    return out;
+  }
+  async function importAll(obj) {
+    if (!obj || !obj.data) throw new Error("Archivo de respaldo inválido");
+    await _clearAll();
+    for (const s of STORES) { if (Array.isArray(obj.data[s])) await _bulk(s, obj.data[s]); }
+    await ensureSeed();
+  }
+
+  // -------- API pública por entidad (async; aquí entraría Supabase) --------
+  // Ejemplo Fase 2:
+  //   getMovimientos: async () => (await supabase.from('movimientos').select('*')).data
+  //   addMovimiento:  async (m) => (await supabase.from('movimientos').insert(m).select().single()).data
+  const nameMap = {
+    Movimientos: "movimientos", Proveedores: "proveedores", Proyectos: "proyectos",
+    Categorias: "categorias", Cuentas: "cuentas", Partidas: "partidas", PagosProgramados: "pagos_programados",
+    Carpetas: "carpetas", Clientes: "clientes", CobrosProgramados: "cobros_programados", Adjuntos: "adjuntos",
+  };
+  const singular = {
+    Movimientos: "Movimiento", Proveedores: "Proveedor", Proyectos: "Proyecto",
+    Categorias: "Categoria", Cuentas: "Cuenta", Partidas: "Partida", PagosProgramados: "PagoProgramado",
+    Carpetas: "Carpeta", Clientes: "Cliente", CobrosProgramados: "CobroProgramado", Adjuntos: "Adjunto",
+  };
+  const api = {};
+  Object.keys(nameMap).forEach((N) => {
+    const store = nameMap[N];
+    const S = singular[N];
+    api[`get${N}`] = () => _all(store);
+    api[`add${S}`] = (o) => _put(store, Object.assign({ id: uid(store.slice(0, 3)) }, o));
+    api[`update${S}`] = (o) => _put(store, o);
+    api[`delete${S}`] = (id) => _del(store, id);
+  });
+  // Adjuntos de un movimiento (carga perezosa, no entran en el reload general)
+  api.getAdjuntosByMov = async (movId) => (await _all("adjuntos")).filter((a) => a.movimiento_id === movId);
+
+  return Object.assign(api, { open, ensureSeed, resetZero, loadExample, wipe, exportAll, importAll });
+})();
+
+/* --------------------------- Cálculos derivados --------------------------- */
+function useDerived(data) {
+  return useMemo(() => {
+    const { movimientos, proyectos, partidas, cuentas } = data;
+    const pagados = movimientos.filter((m) => m.estatus === "pagado");
+
+    const sum = (arr) => arr.reduce((a, m) => a + (Number(m.monto) || 0), 0);
+
+    const obraStats = {};
+    proyectos.forEach((o) => {
+      const ing = sum(pagados.filter((m) => m.tipo === "ingreso" && m.proyecto_id === o.id));
+      const egr = sum(pagados.filter((m) => m.tipo === "egreso" && m.proyecto_id === o.id));
+      const parts = partidas.filter((p) => p.proyecto_id === o.id);
+      const presupuestoTotal = parts.reduce((a, p) => a + (Number(p.presupuesto) || 0), 0);
+      // Costo proyectado: lo presupuestado, pero si ya pagaste de más en una partida, cuenta lo pagado.
+      const costoProyectado = parts.reduce((a, p) => {
+        const pag = sum(pagados.filter((m) => m.tipo === "egreso" && m.partida_id === p.id));
+        return a + Math.max(Number(p.presupuesto) || 0, pag);
+      }, 0);
+      const contratado = Number(o.total_contratado) || 0;
+      const utilidadProyectada = contratado - costoProyectado;
+      obraStats[o.id] = {
+        cobrado: ing, pagado: egr, utilidad: ing - egr,
+        porCobrar: Math.max(0, contratado - ing),
+        avance: contratado ? Math.min(1, ing / contratado) : 0,
+        presupuestoTotal, costoProyectado,
+        porPagar: Math.max(0, costoProyectado - egr),
+        utilidadProyectada,
+        margenProyectado: contratado ? utilidadProyectada / contratado : 0,
+        margenReal: ing ? (ing - egr) / ing : 0,
+      };
+    });
+
+    const partidaStats = {};
+    partidas.forEach((p) => {
+      const pag = sum(pagados.filter((m) => m.tipo === "egreso" && m.partida_id === p.id));
+      partidaStats[p.id] = { pagado: pag, diferencial: (Number(p.presupuesto) || 0) - pag };
+    });
+
+    const cuentaStats = {};
+    cuentas.forEach((c) => {
+      const ing = sum(pagados.filter((m) => m.tipo === "ingreso" && m.cuenta_id === c.id));
+      const egr = sum(pagados.filter((m) => m.tipo === "egreso" && m.cuenta_id === c.id));
+      cuentaStats[c.id] = { saldo: (Number(c.saldo_inicial) || 0) + ing - egr };
+    });
+
+    const totalCobrado = sum(pagados.filter((m) => m.tipo === "ingreso"));
+    const totalPagado = sum(pagados.filter((m) => m.tipo === "egreso"));
+    const utilidadTotal = totalCobrado - totalPagado;
+    const saldoTotal = Object.values(cuentaStats).reduce((a, s) => a + s.saldo, 0);
+    const contratadoTotal = proyectos.reduce((a, o) => a + (Number(o.total_contratado) || 0), 0);
+    const utilidadProyectadaTotal = Object.values(obraStats).reduce((a, s) => a + (s.utilidadProyectada || 0), 0);
+    const margenProyectadoGlobal = contratadoTotal ? utilidadProyectadaTotal / contratadoTotal : 0;
+
+    return { obraStats, partidaStats, cuentaStats, totalCobrado, totalPagado, utilidadTotal, saldoTotal, contratadoTotal, utilidadProyectadaTotal, margenProyectadoGlobal };
+  }, [data]);
+}
+
+/* ------------------------------ UI primitivas ----------------------------- */
+function Card({ children, className = "", onClick }) {
+  return (
+    <div onClick={onClick}
+      className={"rounded-2xl bg-white dark:bg-[#181A20] border border-zinc-200/70 dark:border-zinc-800 " +
+        (onClick ? "active:scale-[.99] transition-transform cursor-pointer " : "") + className}>
+      {children}
+    </div>
+  );
+}
+function Money({ value, sign = false, className = "" }) {
+  const n = Number(value) || 0;
+  const color = n < 0 ? "text-rose-600 dark:text-rose-400" : n > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-zinc-500";
+  return <span className={"num " + (sign ? color : "") + " " + className}>{fmtMXN(n)}</span>;
+}
+function Badge({ color, children, className = "" }) {
+  return (
+    <span className={"inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium " + className}
+      style={{ backgroundColor: color + "22", color }}>
+      <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: color }} />
+      {children}
+    </span>
+  );
+}
+function Seg({ options, value, onChange }) {
+  return (
+    <div className="inline-flex p-0.5 rounded-xl bg-zinc-100 dark:bg-zinc-800 text-sm">
+      {options.map((o) => (
+        <button key={o.value} onClick={() => onChange(o.value)}
+          className={"px-3 py-1.5 rounded-lg transition-colors " +
+            (value === o.value ? "bg-white dark:bg-zinc-700 shadow-sm font-medium" : "text-zinc-500")}>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+function Empty({ icon = "📭", title, hint, action }) {
+  return (
+    <div className="text-center py-12 px-6">
+      <div className="text-4xl mb-2">{icon}</div>
+      <p className="font-medium">{title}</p>
+      {hint && <p className="text-sm text-zinc-500 mt-1">{hint}</p>}
+      {action && <div className="mt-4">{action}</div>}
+    </div>
+  );
+}
+function Sheet({ open, onClose, title, children, footer }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center fade-in" onClick={onClose}>
+      <div className="absolute inset-0 bg-black/40" />
+      <div className="sheet-enter relative w-full max-w-md bg-white dark:bg-[#15171C] rounded-t-3xl max-h-[92vh] flex flex-col"
+        style={{ paddingBottom: "var(--safe-b)" }} onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 pt-4 pb-2">
+          <div className="absolute left-1/2 -translate-x-1/2 top-2 w-10 h-1 rounded-full bg-zinc-300 dark:bg-zinc-700" />
+          <h3 className="text-lg font-semibold mt-1">{title}</h3>
+          <button onClick={onClose} className="text-zinc-400 text-2xl leading-none -mt-1">×</button>
+        </div>
+        <div className="px-5 pb-4 overflow-y-auto">{children}</div>
+        {footer && <div className="px-5 pt-3 pb-4 border-t border-zinc-100 dark:border-zinc-800">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+function Field({ label, children }) {
+  return (
+    <label className="block mb-3">
+      <span className="text-xs font-medium text-zinc-500">{label}</span>
+      <div className="mt-1">{children}</div>
+    </label>
+  );
+}
+const inputCls = "w-full px-3 py-2.5 rounded-xl bg-zinc-100 dark:bg-zinc-800 border border-transparent focus:border-indigo-500 outline-none text-[16px]";
+function TextInput(props) { return <input {...props} className={inputCls + " " + (props.className || "")} />; }
+function Select({ children, ...props }) { return <select {...props} className={inputCls + " appearance-none"}>{children}</select>; }
+function Btn({ children, onClick, variant = "primary", className = "", type }) {
+  const v = {
+    primary: "bg-indigo-600 text-white active:bg-indigo-700",
+    ghost: "bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200",
+    danger: "bg-rose-50 dark:bg-rose-950/40 text-rose-600 dark:text-rose-400",
+  }[variant];
+  return <button type={type} onClick={onClick} className={"w-full py-3 rounded-xl font-medium transition-colors " + v + " " + className}>{children}</button>;
+}
+
+/* ------------------------------- Gráficas --------------------------------- */
+function ChartBox({ type, data, options, height = 220, onPick }) {
+  const ref = useRef(null);
+  const inst = useRef(null);
+  useEffect(() => {
+    if (!ref.current || typeof Chart === "undefined") return;
+    inst.current = new Chart(ref.current, {
+      type, data,
+      options: Object.assign({
+        responsive: true, maintainAspectRatio: false,
+        onClick: (evt, els) => { if (onPick && els && els.length) onPick(els[0].index); },
+      }, options),
+    });
+    return () => { if (inst.current) inst.current.destroy(); };
+  }, [JSON.stringify(data), JSON.stringify(options), type]);
+  return <div style={{ height }}><canvas ref={ref} /></div>;
+}
+
+/* ============================================================================
+   APP
+   =========================================================================== */
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("inicio");
+  const [route, setRoute] = useState(null); // {screen, id}
+  const [dark, setDark] = useState(() => { try { return localStorage.getItem("obras_dark") === "1" || (localStorage.getItem("obras_dark") === null && matchMedia("(prefers-color-scheme: dark)").matches); } catch { return false; } });
+  const [showAdd, setShowAdd] = useState(false);
+  const [editMov, setEditMov] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const [data, setData] = useState({ movimientos: [], proyectos: [], partidas: [], proveedores: [], categorias: [], cuentas: [], pagos_programados: [], carpetas: [], clientes: [], cobros_programados: [] });
+  const [pin, setPinState] = useState(() => { try { return localStorage.getItem("obras_pin") || ""; } catch { return ""; } });
+  const [locked, setLocked] = useState(() => { try { return !!localStorage.getItem("obras_pin"); } catch { return false; } });
+  const [updateReady, setUpdateReady] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+
+  const setPin = (p) => { try { if (p) localStorage.setItem("obras_pin", p); else localStorage.removeItem("obras_pin"); } catch {} setPinState(p || ""); };
+
+  const reload = useCallback(async () => {
+    const [movimientos, proyectos, partidas, proveedores, categorias, cuentas, pagos_programados, carpetas, clientes, cobros_programados] = await Promise.all([
+      db.getMovimientos(), db.getProyectos(), db.getPartidas(), db.getProveedores(), db.getCategorias(), db.getCuentas(), db.getPagosProgramados(), db.getCarpetas(), db.getClientes(), db.getCobrosProgramados(),
+    ]);
+    setData({ movimientos, proyectos, partidas, proveedores, categorias, cuentas, pagos_programados, carpetas, clientes, cobros_programados });
+  }, []);
+
+  useEffect(() => { (async () => { await db.open(); await db.ensureSeed(); await reload(); setLoading(false); })(); }, [reload]);
+  useEffect(() => { document.documentElement.classList.toggle("dark", dark); try { localStorage.setItem("obras_dark", dark ? "1" : "0"); } catch {} }, [dark]);
+  useEffect(() => { const h = () => setUpdateReady(true); window.addEventListener("sw-update", h); return () => window.removeEventListener("sw-update", h); }, []);
+
+  const derived = useDerived(data);
+  const showToast = (msg, undo) => { setToast({ msg, undo }); setTimeout(() => setToast((t) => (t && t.msg === msg ? null : t)), 5000); };
+
+  const go = (screen, id) => { setRoute({ screen, id }); };
+  const back = () => setRoute(null);
+
+  // ------- operaciones -------
+  const saveMov = async (m, fotos) => {
+    await db.updateMovimiento(m); // upsert (los nuevos ya traen id)
+    if (fotos) {
+      for (const id of (fotos.borrar || [])) await db.deleteAdjunto(id);
+      for (const url of (fotos.nuevas || [])) await db.addAdjunto({ movimiento_id: m.id, dataUrl: url, nombre: "", creado_en: todayISO() });
+    }
+    try { localStorage.setItem("obras_last_acc", m.cuenta_id); localStorage.setItem("obras_last_metodo", m.metodo_pago); } catch {}
+    await reload(); showToast("Movimiento guardado");
+  };
+  const removeMov = async (m) => {
+    const adj = await db.getAdjuntosByMov(m.id);
+    await db.deleteMovimiento(m.id); for (const a of adj) await db.deleteAdjunto(a.id);
+    await reload();
+    showToast("Movimiento eliminado", async () => { await db.addMovimiento(m); for (const a of adj) await db.addAdjunto(a); await reload(); setToast(null); });
+  };
+  const marcarPagado = async (pp) => {
+    const mv = {
+      id: uid("mov"), fecha: todayISO(), tipo: "egreso", monto: pp.monto, metodo_pago: "transferencia",
+      cuenta_id: (() => { try { return localStorage.getItem("obras_last_acc") || "acc_bbva"; } catch { return "acc_bbva"; } })(),
+      proyecto_id: pp.proyecto_id, partida_id: pp.partida_id || null, proveedor_id: pp.proveedor_id || null,
+      categoria_id: (data.partidas.find((x) => x.id === pp.partida_id) || {}).categoria_id || null,
+      etapa: "avance", descripcion: "Pago programado", estatus: "pagado", creado_en: todayISO(),
+    };
+    await db.addMovimiento(mv);
+    await db.updatePagoProgramado(Object.assign({}, pp, { estatus: "pagado", movimiento_id: mv.id }));
+    if (pp.recurrencia && pp.recurrencia !== "unica") {
+      const add = { semanal: 7, quincenal: 15, mensual: 30 }[pp.recurrencia] || 30;
+      const next = new Date(pp.fecha_vencimiento + "T00:00:00"); next.setDate(next.getDate() + add);
+      await db.addPagoProgramado({ id: uid("pp"), proyecto_id: pp.proyecto_id, partida_id: pp.partida_id, proveedor_id: pp.proveedor_id, monto: pp.monto, fecha_vencimiento: next.toISOString().slice(0, 10), recurrencia: pp.recurrencia, estatus: "pendiente", movimiento_id: null });
+    }
+    await reload(); showToast("Pago registrado y egreso generado");
+  };
+  const marcarCobrado = async (cp) => {
+    const mv = {
+      id: uid("mov"), fecha: todayISO(), tipo: "ingreso", monto: cp.monto, metodo_pago: "transferencia",
+      cuenta_id: (() => { try { return localStorage.getItem("obras_last_acc") || "acc_bbva"; } catch { return "acc_bbva"; } })(),
+      proyecto_id: cp.proyecto_id, partida_id: null, proveedor_id: null, categoria_id: "cat_cobro",
+      etapa: cp.etapa || "avance", descripcion: "Cobro programado", estatus: "pagado", creado_en: todayISO(),
+    };
+    await db.addMovimiento(mv);
+    await db.updateCobroProgramado(Object.assign({}, cp, { estatus: "cobrado", movimiento_id: mv.id }));
+    if (cp.recurrencia && cp.recurrencia !== "unica") {
+      const add = { semanal: 7, quincenal: 15, mensual: 30 }[cp.recurrencia] || 30;
+      const next = new Date(cp.fecha_vencimiento + "T00:00:00"); next.setDate(next.getDate() + add);
+      await db.addCobroProgramado({ id: uid("cp"), proyecto_id: cp.proyecto_id, cliente_id: cp.cliente_id, etapa: cp.etapa, monto: cp.monto, fecha_vencimiento: next.toISOString().slice(0, 10), recurrencia: cp.recurrencia, estatus: "pendiente", movimiento_id: null });
+    }
+    await reload(); showToast("Cobro registrado e ingreso generado");
+  };
+
+  if (loading) return <div className="min-h-screen grid place-items-center text-zinc-400"><div className="text-center"><div className="text-3xl mb-2 animate-pulse">$</div>Cargando…</div></div>;
+
+  if (locked && pin) return <PinLock pin={pin} dark={dark} onUnlock={() => setLocked(false)} />;
+
+  const ctx = { data, derived, dark, go, back, showToast, reload, setShowAdd, marcarPagado, marcarCobrado, removeMov, setEditMov, openSearch: () => setShowSearch(true), pin, setPin };
+
+  return (
+    <div className="min-h-screen pb-24" style={{ paddingTop: "var(--safe-t)" }}>
+      <div className="max-w-md mx-auto">
+        {route ? (
+          <RouteView route={route} ctx={ctx} />
+        ) : (
+          <div className="fade-in">
+            {tab === "inicio" && <Dashboard ctx={ctx} />}
+            {tab === "obras" && <ObrasList ctx={ctx} />}
+            {tab === "movs" && <Movimientos ctx={ctx} />}
+            {tab === "pagos" && <Pagos ctx={ctx} />}
+            {tab === "mas" && <Mas ctx={ctx} dark={dark} setDark={setDark} />}
+          </div>
+        )}
+      </div>
+
+      {/* FAB */}
+      <button onClick={() => { setEditMov(null); setShowAdd(true); }}
+        className="fixed z-40 right-5 bottom-24 w-14 h-14 rounded-full bg-indigo-600 text-white text-3xl shadow-lg shadow-indigo-600/30 active:scale-95 transition grid place-items-center"
+        style={{ bottom: "calc(5.5rem + var(--safe-b))" }} aria-label="Agregar movimiento">+</button>
+
+      {/* Tab bar */}
+      <nav className="fixed bottom-0 inset-x-0 z-30 bg-white/90 dark:bg-[#101216]/90 backdrop-blur border-t border-zinc-200 dark:border-zinc-800"
+        style={{ paddingBottom: "var(--safe-b)" }}>
+        <div className="max-w-md mx-auto grid grid-cols-5">
+          {[
+            { k: "inicio", i: "📊", l: "Inicio" },
+            { k: "obras", i: "🏗️", l: "Obras" },
+            { k: "movs", i: "↕️", l: "Movs" },
+            { k: "pagos", i: "📅", l: "Pagos" },
+            { k: "mas", i: "⋯", l: "Más" },
+          ].map((t) => (
+            <button key={t.k} onClick={() => { setTab(t.k); back(); }}
+              className={"py-2.5 flex flex-col items-center gap-0.5 text-[11px] " + (tab === t.k && !route ? "text-indigo-600 dark:text-indigo-400" : "text-zinc-400")}>
+              <span className="text-lg">{t.i}</span>{t.l}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      {(showAdd || editMov) && (
+        <MovForm ctx={ctx} mov={editMov} onClose={() => { setShowAdd(false); setEditMov(null); }}
+          onSave={async (m, fotos) => { await saveMov(m, fotos); setShowAdd(false); setEditMov(null); }} />
+      )}
+
+      {showSearch && <SearchOverlay ctx={ctx} onClose={() => setShowSearch(false)} />}
+
+      {updateReady && (
+        <div className="fixed left-1/2 -translate-x-1/2 z-50 bg-indigo-600 text-white px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-3 text-sm"
+          style={{ bottom: "calc(6.5rem + var(--safe-b))" }}>
+          Nueva versión disponible
+          <button onClick={() => window.location.reload()} className="font-semibold underline">Actualizar</button>
+        </div>
+      )}
+
+      {toast && (
+        <div className="fixed left-1/2 -translate-x-1/2 z-50 bottom-28 bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-3 text-sm"
+          style={{ bottom: "calc(6.5rem + var(--safe-b))" }}>
+          {toast.msg}
+          {toast.undo && <button onClick={toast.undo} className="font-semibold text-indigo-300 dark:text-indigo-600">Deshacer</button>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------- Router simple ------------------------------ */
+function RouteView({ route, ctx }) {
+  if (route.screen === "obra") return <ObraDetail ctx={ctx} id={route.id} />;
+  if (route.screen === "proveedor") return <ProveedorDetail ctx={ctx} id={route.id} />;
+  if (route.screen === "proveedores") return <Proveedores ctx={ctx} />;
+  if (route.screen === "categorias") return <Categorias ctx={ctx} />;
+  if (route.screen === "cuentas") return <Cuentas ctx={ctx} />;
+  if (route.screen === "clientes") return <Clientes ctx={ctx} />;
+  if (route.screen === "reportes") return <Reportes ctx={ctx} />;
+  return null;
+}
+function Header({ title, onBack, right }) {
+  return (
+    <div className="sticky top-0 z-20 bg-[#FAFAF8]/90 dark:bg-[#0E0F13]/90 backdrop-blur px-4 py-3 flex items-center gap-2"
+      style={{ paddingTop: "calc(0.75rem + var(--safe-t))" }}>
+      {onBack && <button onClick={onBack} className="text-2xl -ml-1 text-zinc-500">‹</button>}
+      <h1 className="text-xl font-bold flex-1">{title}</h1>
+      {right}
+    </div>
+  );
+}
+
+/* ------------------------------- DASHBOARD -------------------------------- */
+function Dashboard({ ctx }) {
+  const { data, derived, dark, go } = ctx;
+  const [periodo, setPeriodo] = useState("6m"); // mes | 6m | todo
+
+  const movFiltered = useMemo(() => {
+    const m = data.movimientos.filter((x) => x.estatus === "pagado");
+    if (periodo === "todo") return m;
+    if (periodo === "mes") { const k = todayISO().slice(0, 7); return m.filter((x) => monthKey(x.fecha) === k); }
+    const lim = isoFrom(-183); return m.filter((x) => x.fecha >= lim);
+  }, [data.movimientos, periodo]);
+
+  // Utilidad por obra
+  const obrasActivas = data.proyectos;
+  const utilData = {
+    labels: obrasActivas.map((o) => o.nombre),
+    datasets: [{
+      label: "Utilidad",
+      data: obrasActivas.map((o) => derived.obraStats[o.id]?.utilidad || 0),
+      backgroundColor: obrasActivas.map((o) => (derived.obraStats[o.id]?.utilidad || 0) >= 0 ? "#059669" : "#E11D48"),
+      borderRadius: 8,
+    }],
+  };
+  // Gasto por rubro (egresos del periodo)
+  const rubro = {};
+  movFiltered.filter((m) => m.tipo === "egreso").forEach((m) => {
+    const c = data.categorias.find((c) => c.id === m.categoria_id);
+    const key = c ? c.nombre : "Otro";
+    rubro[key] = (rubro[key] || 0) + Number(m.monto || 0);
+    if (c) rubro["__c_" + key] = c.color;
+  });
+  const rubroLabels = Object.keys(rubro).filter((k) => !k.startsWith("__c_"));
+  const rubroData = {
+    labels: rubroLabels,
+    datasets: [{ data: rubroLabels.map((k) => rubro[k]), backgroundColor: rubroLabels.map((k) => rubro["__c_" + k] || "#999"), borderWidth: 0 }],
+  };
+  // Flujo mensual (ing vs egr)
+  const months = [];
+  for (let i = 5; i >= 0; i--) { const d = new Date(); d.setMonth(d.getMonth() - i); months.push(d.toISOString().slice(0, 7)); }
+  const ingByM = months.map((k) => movFiltered.filter((m) => m.tipo === "ingreso" && monthKey(m.fecha) === k).reduce((a, m) => a + Number(m.monto || 0), 0));
+  const egrByM = months.map((k) => movFiltered.filter((m) => m.tipo === "egreso" && monthKey(m.fecha) === k).reduce((a, m) => a + Number(m.monto || 0), 0));
+  const flujoData = {
+    labels: months.map(monthLabel),
+    datasets: [
+      { label: "Ingresos", data: ingByM, backgroundColor: "#10B981", borderRadius: 6 },
+      { label: "Egresos", data: egrByM, backgroundColor: "#F43F5E", borderRadius: 6 },
+    ],
+  };
+  const tick = dark ? "#9CA3AF" : "#6B7280";
+  const grid = dark ? "#26272B" : "#ECECEC";
+  const baseOpts = (showLegend) => ({
+    plugins: {
+      legend: { display: showLegend, labels: { color: tick, boxWidth: 10, font: { size: 11 } } },
+      tooltip: { callbacks: { label: (c) => (c.dataset.label ? c.dataset.label + ": " : "") + fmtMXN0(c.parsed.y ?? c.parsed) } },
+    },
+    scales: { x: { ticks: { color: tick, font: { size: 10 } }, grid: { display: false } }, y: { ticks: { color: tick, font: { size: 10 }, callback: (v) => fmtMXN0(v) }, grid: { color: grid } } },
+  });
+
+  const sobregiros = data.partidas.filter((p) => (derived.partidaStats[p.id]?.diferencial || 0) < 0);
+  const proximos = data.pagos_programados.filter((p) => p.estatus === "pendiente").sort((a, b) => a.fecha_vencimiento.localeCompare(b.fecha_vencimiento));
+  const venc7 = proximos.filter((p) => p.fecha_vencimiento <= isoFrom(7));
+
+  // Flujo de caja proyectado (8 semanas)
+  const cashflow = buildCashflow(derived.saldoTotal, data.pagos_programados, data.cobros_programados, 8);
+  const cashflowData = { labels: cashflow.map((p) => p.label), datasets: [{ label: "Saldo proyectado", data: cashflow.map((p) => p.balance), borderColor: "#4F46E5", backgroundColor: "rgba(79,70,229,0.12)", fill: true, tension: 0.3, pointRadius: 2 }] };
+  const minBal = Math.min(0, ...cashflow.map((p) => p.balance));
+
+  return (
+    <div>
+      <Header title="Inicio" right={<div className="flex items-center gap-3"><button onClick={ctx.openSearch} aria-label="Buscar" className="text-lg">🔎</button><Seg value={periodo} onChange={setPeriodo} options={[{ value: "mes", label: "Mes" }, { value: "6m", label: "6m" }, { value: "todo", label: "Todo" }]} /></div>} />
+      <div className="px-4 space-y-4">
+        {/* KPIs */}
+        <div className="grid grid-cols-2 gap-3">
+          <Card className="p-4">
+            <p className="text-xs text-zinc-500">Utilidad total</p>
+            <p className="text-2xl font-bold mt-1"><Money value={derived.utilidadTotal} sign /></p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs text-zinc-500">Saldo en cuentas</p>
+            <p className="text-2xl font-bold mt-1 num">{fmtMXN0(derived.saldoTotal)}</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs text-zinc-500">Cobrado</p>
+            <p className="text-lg font-semibold mt-1 num text-emerald-600 dark:text-emerald-400">{fmtMXN0(derived.totalCobrado)}</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs text-zinc-500">Pagado</p>
+            <p className="text-lg font-semibold mt-1 num text-rose-600 dark:text-rose-400">{fmtMXN0(derived.totalPagado)}</p>
+          </Card>
+        </div>
+
+        {/* Proyección de utilidad/margen */}
+        <Card className="p-4">
+          <div className="flex justify-between items-center">
+            <div>
+              <p className="text-xs text-zinc-500">Utilidad proyectada</p>
+              <p className="text-[11px] text-zinc-400">si todo sale a presupuesto</p>
+              <p className="text-xl font-bold mt-1"><Money value={derived.utilidadProyectadaTotal} sign /></p>
+            </div>
+            <div className="text-right">
+              <p className="text-xs text-zinc-500">Margen</p>
+              <p className={"text-2xl font-bold num " + (derived.margenProyectadoGlobal >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400")}>{Math.round(derived.margenProyectadoGlobal * 100)}%</p>
+            </div>
+          </div>
+        </Card>
+
+        {/* Flujo de caja proyectado */}
+        <Card className="p-4">
+          <p className="font-semibold mb-1">Flujo de caja proyectado</p>
+          <p className="text-xs text-zinc-500 mb-2">Saldo estimado próximas 8 semanas (cobros − pagos programados).</p>
+          <ChartBox type="line" data={cashflowData} height={190}
+            options={{ plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => fmtMXN0(c.parsed.y) } } }, scales: { x: { ticks: { color: tick, font: { size: 10 } }, grid: { display: false } }, y: { suggestedMin: minBal, ticks: { color: tick, font: { size: 10 }, callback: (v) => fmtMXN0(v) }, grid: { color: grid } } } }} />
+          {minBal < 0 && <p className="text-[11px] text-rose-600 dark:text-rose-400 mt-1">⚠️ El saldo proyectado se vuelve negativo. Ojo con la liquidez.</p>}
+        </Card>
+
+        {/* Próximos pagos */}
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-2">
+            <p className="font-semibold">Próximos pagos</p>
+            <span className="text-xs text-zinc-500">{venc7.length} en 7 días</span>
+          </div>
+          {proximos.length === 0 ? <p className="text-sm text-zinc-500">Nada pendiente. 🎉</p> : (
+            <div className="space-y-2">
+              {proximos.slice(0, 4).map((p) => {
+                const prov = data.proveedores.find((x) => x.id === p.proveedor_id);
+                const obra = data.proyectos.find((x) => x.id === p.proyecto_id);
+                const vencido = p.fecha_vencimiento < todayISO();
+                const pronto = !vencido && p.fecha_vencimiento <= isoFrom(7);
+                return (
+                  <div key={p.id} className="flex items-center justify-between text-sm">
+                    <div>
+                      <p className="font-medium">{prov?.nombre || "—"} <span className="text-zinc-400 font-normal">· {obra?.nombre}</span></p>
+                      <p className={"text-xs " + (vencido ? "text-rose-600 dark:text-rose-400 font-medium" : pronto ? "text-amber-600 dark:text-amber-400" : "text-zinc-500")}>
+                        {vencido ? "Vencido " : ""}{fmtDate(p.fecha_vencimiento)}
+                      </p>
+                    </div>
+                    <button onClick={() => ctx.marcarPagado(p)} className="num font-semibold text-right">
+                      {fmtMXN0(p.monto)}<span className="block text-[11px] text-indigo-600 dark:text-indigo-400 font-medium">Marcar pagado</span>
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+
+        {/* Utilidad por obra */}
+        <Card className="p-4">
+          <p className="font-semibold mb-2">Utilidad por obra</p>
+          <p className="text-xs text-zinc-500 mb-2">Toca una barra para abrir la obra.</p>
+          <ChartBox type="bar" data={utilData} options={baseOpts(false)} height={200}
+            onPick={(i) => go("obra", obrasActivas[i].id)} />
+        </Card>
+
+        <div className="grid gap-4">
+          {/* Gasto por rubro */}
+          <Card className="p-4">
+            <p className="font-semibold mb-2">Gasto por rubro</p>
+            {rubroLabels.length ? (
+              <ChartBox type="doughnut" data={rubroData} height={220}
+                options={{ plugins: { legend: { position: "right", labels: { color: tick, boxWidth: 10, font: { size: 11 } } }, tooltip: { callbacks: { label: (c) => c.label + ": " + fmtMXN0(c.parsed) } } }, cutout: "62%" }} />
+            ) : <p className="text-sm text-zinc-500 py-6 text-center">Sin egresos en el periodo.</p>}
+          </Card>
+          {/* Flujo mensual */}
+          <Card className="p-4">
+            <p className="font-semibold mb-2">Ingresos vs egresos (6 meses)</p>
+            <ChartBox type="bar" data={flujoData} options={baseOpts(true)} height={220} />
+          </Card>
+        </div>
+
+        {/* Sobregiros */}
+        {sobregiros.length > 0 && (
+          <Card className="p-4 border-rose-200 dark:border-rose-900/50">
+            <p className="font-semibold mb-2 text-rose-600 dark:text-rose-400">⚠️ Partidas sobregiradas</p>
+            <div className="space-y-1.5">
+              {sobregiros.map((p) => {
+                const prov = data.proveedores.find((x) => x.id === p.proveedor_id);
+                const obra = data.proyectos.find((x) => x.id === p.proyecto_id);
+                return (
+                  <div key={p.id} className="flex justify-between text-sm" onClick={() => go("obra", p.proyecto_id)}>
+                    <span>{prov?.nombre} · <span className="text-zinc-400">{obra?.nombre}</span></span>
+                    <Money value={derived.partidaStats[p.id].diferencial} sign className="text-sm" />
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------- OBRAS ----------------------------------- */
+function ObraCard({ o, s, go }) {
+  return (
+    <Card className="p-4" onClick={() => go("obra", o.id)}>
+      <div className="flex items-start justify-between">
+        <div className="flex items-center gap-2">
+          <span className="w-3 h-3 rounded-full mt-1" style={{ backgroundColor: o.color }} />
+          <div>
+            <p className="font-semibold flex items-center gap-2">{o.nombre}{o.estatus === "cerrado" && <Badge color="#6B7280">Terminada</Badge>}</p>
+            <p className="text-xs text-zinc-500">{o.cliente}</p>
+          </div>
+        </div>
+        <Money value={s.utilidad} sign className="font-bold" />
+      </div>
+      <div className="mt-3 flex items-center gap-3 text-xs text-zinc-500">
+        <span>Cobrado <b className="text-emerald-600 dark:text-emerald-400 num">{fmtMXN0(s.cobrado)}</b></span>
+        <span>Pagado <b className="text-rose-600 dark:text-rose-400 num">{fmtMXN0(s.pagado)}</b></span>
+        <span>Margen <b className="num">{Math.round((s.margenProyectado || 0) * 100)}%</b></span>
+      </div>
+      <div className="mt-2 h-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
+        <div className="h-full rounded-full" style={{ width: (s.avance * 100 || 0) + "%", backgroundColor: o.color }} />
+      </div>
+      <p className="text-[11px] text-zinc-400 mt-1">{Math.round((s.avance || 0) * 100)}% cobrado de {fmtMXN0(o.total_contratado)}</p>
+    </Card>
+  );
+}
+
+function ObrasList({ ctx }) {
+  const { data, derived, go } = ctx;
+  const [showNew, setShowNew] = useState(false);
+  const [newFolder, setNewFolder] = useState(false);
+  const [editFolder, setEditFolder] = useState(null);
+  const [collapsed, setCollapsed] = useState({});
+
+  const obrasEn = (cid) => data.proyectos.filter((o) => (o.carpeta_id || null) === cid);
+  const sinCarpeta = obrasEn(null);
+  const carpetas = data.carpetas.slice().sort((a, b) => (a.archivada === b.archivada ? 0 : a.archivada ? 1 : -1));
+  const sumUtil = (obras) => obras.reduce((a, o) => a + (derived.obraStats[o.id]?.utilidad || 0), 0);
+  const isColl = (c) => (collapsed[c.id] !== undefined ? collapsed[c.id] : !!c.archivada);
+  const toggle = (id) => setCollapsed((s) => ({ ...s, [id]: !(s[id] !== undefined ? s[id] : false) }));
+
+  const Folder = ({ c }) => {
+    const obras = obrasEn(c.id);
+    const coll = isColl(c);
+    return (
+      <div className={c.archivada ? "opacity-70" : ""}>
+        <div className="flex items-center gap-2 px-1 py-2">
+          <button onClick={() => toggle(c.id)} className="flex items-center gap-2 flex-1 text-left">
+            <span className={"text-zinc-400 transition-transform " + (coll ? "" : "rotate-90")}>›</span>
+            <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: c.color }} />
+            <span className="font-semibold">{c.nombre}</span>
+            <span className="text-xs text-zinc-400">{obras.length}</span>
+            {c.archivada && <Badge color="#6B7280">Cerrada</Badge>}
+          </button>
+          <span className="num text-sm mr-2"><Money value={sumUtil(obras)} sign className="text-sm" /></span>
+          <button onClick={() => setEditFolder(c)} className="text-zinc-400 text-lg px-1">⋯</button>
+        </div>
+        {!coll && (
+          <div className="space-y-3 pl-2 pb-2">
+            {obras.length === 0 ? <p className="text-xs text-zinc-400 px-2 pb-2">Carpeta vacía. Asigna obras desde su edición.</p> :
+              obras.map((o) => <ObraCard key={o.id} o={o} s={derived.obraStats[o.id] || {}} go={go} />)}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <Header title="Obras" right={
+        <div className="flex items-center gap-3 text-sm font-medium">
+          <button onClick={() => setNewFolder(true)} className="text-indigo-600 dark:text-indigo-400">+ Carpeta</button>
+          <button onClick={() => setShowNew(true)} className="text-indigo-600 dark:text-indigo-400">+ Obra</button>
+        </div>} />
+      <div className="px-4 space-y-2">
+        {data.proyectos.length === 0 && data.carpetas.length === 0 &&
+          <Empty icon="🏗️" title="Sin obras todavía" hint="Crea una obra o una carpeta para organizar." action={<Btn onClick={() => setShowNew(true)}>Nueva obra</Btn>} />}
+
+        {carpetas.map((c) => <Folder key={c.id} c={c} />)}
+
+        {sinCarpeta.length > 0 && (
+          <div>
+            {carpetas.length > 0 && <p className="text-xs font-medium text-zinc-500 px-1 py-2">Sin carpeta</p>}
+            <div className="space-y-3">
+              {sinCarpeta.map((o) => <ObraCard key={o.id} o={o} s={derived.obraStats[o.id] || {}} go={go} />)}
+            </div>
+          </div>
+        )}
+      </div>
+      {showNew && <ObraForm ctx={ctx} onClose={() => setShowNew(false)} />}
+      {(newFolder || editFolder) && <CarpetaForm ctx={ctx} carpeta={editFolder} onClose={() => { setNewFolder(false); setEditFolder(null); }} />}
+    </div>
+  );
+}
+
+function CarpetaForm({ ctx, carpeta, onClose }) {
+  const { data, reload, showToast } = ctx;
+  const [f, setF] = useState(carpeta || { nombre: "", color: PROYECTO_COLORS[(data.carpetas.length) % PROYECTO_COLORS.length], archivada: false });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = async () => {
+    if (!f.nombre) return showToast("Ponle nombre a la carpeta");
+    if (f.id) await db.updateCarpeta(f); else await db.addCarpeta({ ...f, creado_en: todayISO() });
+    await reload(); onClose(); showToast(f.id ? "Carpeta actualizada" : "Carpeta creada");
+  };
+  const archivar = async () => { await db.updateCarpeta({ ...f, archivada: !f.archivada }); await reload(); onClose(); showToast(f.archivada ? "Carpeta reactivada" : "Carpeta cerrada"); };
+  const del = async () => {
+    if (!confirm("¿Borrar la carpeta? Las obras NO se borran, solo se quedan sin carpeta.")) return;
+    for (const o of data.proyectos.filter((o) => o.carpeta_id === f.id)) await db.updateProyecto({ ...o, carpeta_id: null });
+    await db.deleteCarpeta(f.id); await reload(); onClose(); showToast("Carpeta eliminada");
+  };
+  return (
+    <Sheet open onClose={onClose} title={carpeta ? "Editar carpeta" : "Nueva carpeta"}
+      footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{carpeta && <Btn variant="ghost" onClick={archivar}>{f.archivada ? "Reactivar carpeta" : "Cerrar carpeta (ya no la toco)"}</Btn>}{carpeta && <Btn variant="danger" onClick={del}>Eliminar carpeta</Btn>}</div>}>
+      <Field label="Nombre"><TextInput value={f.nombre} onChange={set("nombre")} placeholder="Obras de junio" /></Field>
+      <Field label="Color"><div className="flex gap-2 flex-wrap">{PROYECTO_COLORS.map((c) => <button key={c} onClick={() => setF({ ...f, color: c })} className={"w-8 h-8 rounded-full " + (f.color === c ? "ring-2 ring-offset-2 ring-indigo-500 dark:ring-offset-zinc-900" : "")} style={{ backgroundColor: c }} />)}</div></Field>
+    </Sheet>
+  );
+}
+
+function ObraDetail({ ctx, id }) {
+  const { data, derived, back, go, dark, reload, showToast, setEditMov } = ctx;
+  const obra = data.proyectos.find((o) => o.id === id);
+  const [edit, setEdit] = useState(false);
+  const [addPartida, setAddPartida] = useState(false);
+  if (!obra) return <div className="p-6">Obra no encontrada. <button onClick={back} className="text-indigo-600">Volver</button></div>;
+  const s = derived.obraStats[id] || {};
+  const cerrada = obra.estatus === "cerrado";
+  const partidas = data.partidas.filter((p) => p.proyecto_id === id);
+  const movsObra = data.movimientos.filter((m) => m.proyecto_id === id).sort((a, b) => b.fecha.localeCompare(a.fecha));
+  const cobros = movsObra.filter((m) => m.tipo === "ingreso");
+  const pagadosObra = movsObra.filter((m) => m.estatus === "pagado");
+  const egObra = pagadosObra.filter((m) => m.tipo === "egreso");
+  const sum = (arr) => arr.reduce((a, m) => a + (Number(m.monto) || 0), 0);
+  const efe = sum(egObra.filter((m) => m.metodo_pago === "efectivo"));
+  const tra = sum(egObra.filter((m) => m.metodo_pago === "transferencia"));
+  const pendObra = data.pagos_programados.filter((p) => p.proyecto_id === id && p.estatus === "pendiente");
+  const pendMonto = pendObra.reduce((a, p) => a + (Number(p.monto) || 0), 0);
+
+  // dona: gasto por rubro de la obra
+  const rubro = {};
+  egObra.forEach((m) => { const c = data.categorias.find((c) => c.id === m.categoria_id); const k = c ? c.nombre : "Otro"; rubro[k] = (rubro[k] || 0) + Number(m.monto || 0); if (c) rubro["__c_" + k] = c.color; });
+  const rl = Object.keys(rubro).filter((k) => !k.startsWith("__c_"));
+  const donaData = { labels: rl, datasets: [{ data: rl.map((k) => rubro[k]), backgroundColor: rl.map((k) => rubro["__c_" + k] || "#999"), borderWidth: 0 }] };
+  const tick = dark ? "#9CA3AF" : "#6B7280";
+
+  const exportObraCSV = () => exportMovsCSV(movsObra, data, `obra_${obra.nombre.replace(/[^\w]+/g, "_")}_${todayISO()}.csv`);
+  const toggleEstatus = async () => {
+    const next = cerrada ? "activo" : "cerrado";
+    if (next === "cerrado" && !confirm("¿Marcar esta obra como terminada? Podrás reactivarla después.")) return;
+    await db.updateProyecto(Object.assign({}, obra, { estatus: next }));
+    await reload(); showToast(cerrada ? "Obra reactivada" : "Obra terminada ✓");
+  };
+
+  return (
+    <div>
+      <Header title={obra.nombre} onBack={back} right={<button onClick={() => setEdit(true)} className="text-sm text-indigo-600 dark:text-indigo-400">Editar</button>} />
+      <div className="px-4 space-y-4">
+        {/* ---- Dashboard de la obra ---- */}
+        <Card className="p-4">
+          <div className="flex justify-between items-baseline">
+            <div className="flex items-center gap-2">
+              <p className="text-xs text-zinc-500">Utilidad</p>
+              {cerrada && <Badge color="#6B7280">Terminada</Badge>}
+            </div>
+            <Money value={s.utilidad} sign className="text-2xl font-bold" />
+          </div>
+          {/* % avance de cobro */}
+          <div className="mt-3 h-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
+            <div className="h-full rounded-full" style={{ width: ((s.avance || 0) * 100) + "%", backgroundColor: obra.color }} />
+          </div>
+          <p className="text-[11px] text-zinc-400 mt-1">{Math.round((s.avance || 0) * 100)}% cobrado de {fmtMXN0(obra.total_contratado)}</p>
+
+          <div className="grid grid-cols-2 gap-2 mt-4">
+            <div className="rounded-xl bg-zinc-50 dark:bg-zinc-800/50 p-3"><p className="text-[11px] text-zinc-500">Cobrado</p><p className="num font-semibold text-emerald-600 dark:text-emerald-400">{fmtMXN0(s.cobrado)}</p></div>
+            <div className="rounded-xl bg-zinc-50 dark:bg-zinc-800/50 p-3"><p className="text-[11px] text-zinc-500">Pagado</p><p className="num font-semibold text-rose-600 dark:text-rose-400">{fmtMXN0(s.pagado)}</p></div>
+            <div className="rounded-xl bg-zinc-50 dark:bg-zinc-800/50 p-3"><p className="text-[11px] text-zinc-500">Por cobrar</p><p className="num font-semibold">{fmtMXN0(s.porCobrar)}</p></div>
+            <div className="rounded-xl bg-zinc-50 dark:bg-zinc-800/50 p-3"><p className="text-[11px] text-zinc-500">Pendiente por pagar</p><p className="num font-semibold text-amber-600 dark:text-amber-400">{fmtMXN0(pendMonto)}</p></div>
+          </div>
+
+          {/* Efectivo vs transferencia (como en tu Excel) */}
+          <div className="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800 flex justify-around text-center text-xs">
+            <div><p className="text-zinc-500">Pagado en efectivo</p><p className="num font-semibold mt-0.5">{fmtMXN0(efe)}</p></div>
+            <div><p className="text-zinc-500">Pagado por transfer.</p><p className="num font-semibold mt-0.5">{fmtMXN0(tra)}</p></div>
+          </div>
+
+          {/* Proyección: si todo sale a presupuesto */}
+          <div className="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800 flex justify-between items-center">
+            <div>
+              <p className="text-[11px] text-zinc-500">Utilidad proyectada</p>
+              <Money value={s.utilidadProyectada} sign className="font-semibold" />
+            </div>
+            <div className="text-center">
+              <p className="text-[11px] text-zinc-500">Costo proy.</p>
+              <p className="num font-semibold text-sm">{fmtMXN0(s.costoProyectado)}</p>
+            </div>
+            <div className="text-right">
+              <p className="text-[11px] text-zinc-500">Margen proy.</p>
+              <p className={"num font-bold " + ((s.margenProyectado || 0) >= 0 ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400")}>{Math.round((s.margenProyectado || 0) * 100)}%</p>
+            </div>
+          </div>
+          <p className="text-[11px] text-zinc-400 mt-1">Cliente: {clienteNombre(obra, data)}</p>
+
+          {(obra.honorarios || obra.indirectos || obra.iva) ? (
+            <div className="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800 text-xs text-zinc-500 flex gap-4 flex-wrap">
+              {obra.honorarios ? <span>Honorarios {fmtMXN0(obra.honorarios)}</span> : null}
+              {obra.indirectos ? <span>Indirectos {fmtMXN0(obra.indirectos)}</span> : null}
+              {obra.iva ? <span>IVA {fmtMXN0(obra.iva)}</span> : null}
+            </div>
+          ) : null}
+        </Card>
+
+        {/* Acciones */}
+        <div className="grid grid-cols-2 gap-2">
+          <Btn variant="ghost" onClick={exportObraCSV}>⬇️ CSV de la obra</Btn>
+          <Btn variant="ghost" onClick={toggleEstatus}>{cerrada ? "↩︎ Reactivar" : "✓ Marcar terminada"}</Btn>
+        </div>
+
+        {obra.notas ? (
+          <Card className="p-4">
+            <p className="font-semibold mb-1">Bitácora</p>
+            <p className="text-sm text-zinc-600 dark:text-zinc-300 whitespace-pre-wrap">{obra.notas}</p>
+          </Card>
+        ) : null}
+
+        {/* Gasto por rubro de la obra */}
+        {rl.length > 0 && (
+          <Card className="p-4">
+            <p className="font-semibold mb-2">Gasto por rubro</p>
+            <ChartBox type="doughnut" data={donaData} height={210}
+              options={{ plugins: { legend: { position: "right", labels: { color: tick, boxWidth: 10, font: { size: 11 } } }, tooltip: { callbacks: { label: (c) => c.label + ": " + fmtMXN0(c.parsed) } } }, cutout: "62%" }} />
+          </Card>
+        )}
+
+        {/* Partidas / proveedores con diferencial */}
+        <Card className="p-4">
+          <div className="flex items-center justify-between mb-3">
+            <p className="font-semibold">Partidas (presupuesto vs pagado)</p>
+            <button onClick={() => setAddPartida(true)} className="text-sm text-indigo-600 dark:text-indigo-400">+ Partida</button>
+          </div>
+          {partidas.length === 0 ? <p className="text-sm text-zinc-500">Sin partidas. Agrega proveedores y su presupuesto.</p> : (
+            <div className="space-y-3">
+              {partidas.map((p) => {
+                const ps = derived.partidaStats[p.id] || {};
+                const prov = data.proveedores.find((x) => x.id === p.proveedor_id);
+                const cat = data.categorias.find((x) => x.id === p.categoria_id);
+                const pct = p.presupuesto ? Math.min(1, (ps.pagado || 0) / p.presupuesto) : 0;
+                const over = (ps.diferencial || 0) < 0;
+                return (
+                  <div key={p.id}>
+                    <div className="flex justify-between text-sm">
+                      <span className="font-medium">{prov?.nombre} <span className="text-zinc-400 font-normal">· {p.concepto}</span></span>
+                      <span className={"num text-xs font-semibold " + (over ? "text-rose-600 dark:text-rose-400" : "text-zinc-500")}>
+                        {over ? "Sobregiro " : "Disp. "}{fmtMXN0(Math.abs(ps.diferencial || 0))}
+                      </span>
+                    </div>
+                    <div className="mt-1 h-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 overflow-hidden">
+                      <div className="h-full rounded-full" style={{ width: (pct * 100) + "%", backgroundColor: over ? "#E11D48" : (cat?.color || "#4F46E5") }} />
+                    </div>
+                    <p className="text-[11px] text-zinc-400 mt-0.5">{fmtMXN0(ps.pagado)} de {fmtMXN0(p.presupuesto)}</p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+
+        {/* Cobros por etapa */}
+        <Card className="p-4">
+          <p className="font-semibold mb-2">Cobros del cliente</p>
+          {cobros.length === 0 ? <p className="text-sm text-zinc-500">Sin cobros registrados.</p> : (
+            <div className="space-y-1.5">
+              {cobros.map((m) => (
+                <div key={m.id} className="flex justify-between items-center text-sm">
+                  <span className="capitalize">{m.etapa || "cobro"} <span className="text-zinc-400">· {fmtDate(m.fecha)}</span></span>
+                  <span className="flex items-center gap-2">
+                    <span className="num text-emerald-600 dark:text-emerald-400 font-medium">{fmtMXN0(m.monto)}</span>
+                    <button onClick={() => notaPDF(m, data)} className="text-[11px] px-2 py-0.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-indigo-600 dark:text-indigo-400 font-medium">PDF</button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        {/* Todos los movimientos de la obra */}
+        <Card className="p-4">
+          <p className="font-semibold mb-2">Movimientos de la obra</p>
+          {movsObra.length === 0 ? <p className="text-sm text-zinc-500">Sin movimientos.</p> : (
+            <div className="divide-y divide-zinc-100 dark:divide-zinc-800">
+              {movsObra.map((m) => {
+                const prov = data.proveedores.find((x) => x.id === m.proveedor_id);
+                const cat = data.categorias.find((x) => x.id === m.categoria_id);
+                return (
+                  <div key={m.id} className="flex items-center gap-2 py-2">
+                    <div className="flex-1 min-w-0" onClick={() => setEditMov(m)}>
+                      <p className="text-sm font-medium truncate">{prov?.nombre || cat?.nombre || (m.tipo === "ingreso" ? "Cobro" : "Egreso")}{m.etapa ? <span className="text-zinc-400 font-normal"> · {m.etapa}</span> : null}</p>
+                      <p className="text-[11px] text-zinc-500">{fmtDate(m.fecha)} · {m.metodo_pago}{m.estatus !== "pagado" ? " · " + m.estatus : ""}</p>
+                    </div>
+                    <span className={"num text-sm font-semibold " + (m.tipo === "ingreso" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400")}>{m.tipo === "ingreso" ? "+" : "−"}{fmtMXN0(m.monto)}</span>
+                    <button onClick={() => notaPDF(m, data)} className="text-[11px] px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-indigo-600 dark:text-indigo-400 font-medium shrink-0">PDF</button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+      </div>
+      {edit && <ObraForm ctx={ctx} obra={obra} onClose={() => setEdit(false)} />}
+      {addPartida && <PartidaForm ctx={ctx} proyecto_id={id} onClose={() => setAddPartida(false)} />}
+    </div>
+  );
+}
+
+function ObraForm({ ctx, obra, onClose }) {
+  const { reload, showToast, data, back } = ctx;
+  const [f, setF] = useState(obra || { nombre: "", cliente: "", cliente_id: "", carpeta_id: "", color: PROYECTO_COLORS[data.proyectos.length % PROYECTO_COLORS.length], estatus: "activo", total_contratado: "", honorarios: "", indirectos: "", iva: "", notas: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = async () => {
+    if (!f.nombre) return showToast("Ponle nombre a la obra");
+    const obj = { ...f, cliente_id: f.cliente_id || null, carpeta_id: f.carpeta_id || null, total_contratado: Number(f.total_contratado) || 0, honorarios: Number(f.honorarios) || 0, indirectos: Number(f.indirectos) || 0, iva: Number(f.iva) || 0 };
+    if (obj.id) await db.updateProyecto(obj); else await db.addProyecto({ ...obj, creado_en: todayISO() });
+    await reload(); onClose(); showToast(obj.id ? "Obra actualizada" : "Obra creada");
+  };
+  const del = async () => { if (!confirm("¿Eliminar la obra y sus movimientos quedan huérfanos? Se borra solo la obra.")) return; await db.deleteProyecto(f.id); await reload(); onClose(); back(); showToast("Obra eliminada"); };
+  return (
+    <Sheet open onClose={onClose} title={obra ? "Editar obra" : "Nueva obra"}
+      footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{obra && <Btn variant="danger" onClick={del}>Eliminar obra</Btn>}</div>}>
+      <Field label="Nombre"><TextInput value={f.nombre} onChange={set("nombre")} placeholder="Casa 8 / Pintura" /></Field>
+      <Field label="Cliente">
+        <Select value={f.cliente_id || ""} onChange={set("cliente_id")}>
+          <option value="">— sin cliente / usar texto —</option>
+          {data.clientes.map((c) => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+        </Select>
+      </Field>
+      {!f.cliente_id && <Field label="Cliente (texto libre)"><TextInput value={f.cliente} onChange={set("cliente")} placeholder="Familia…" /></Field>}
+      <Field label="Carpeta">
+        <Select value={f.carpeta_id || ""} onChange={set("carpeta_id")}>
+          <option value="">— sin carpeta —</option>
+          {data.carpetas.map((c) => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+        </Select>
+      </Field>
+      <Field label="Total contratado (con IVA)"><TextInput type="number" inputMode="decimal" value={f.total_contratado} onChange={set("total_contratado")} placeholder="0.00" /></Field>
+      <div className="grid grid-cols-3 gap-2">
+        <Field label="Honorarios"><TextInput type="number" inputMode="decimal" value={f.honorarios} onChange={set("honorarios")} /></Field>
+        <Field label="Indirectos"><TextInput type="number" inputMode="decimal" value={f.indirectos} onChange={set("indirectos")} /></Field>
+        <Field label="IVA"><TextInput type="number" inputMode="decimal" value={f.iva} onChange={set("iva")} /></Field>
+      </div>
+      <Field label="Color">
+        <div className="flex gap-2 flex-wrap">{PROYECTO_COLORS.map((c) => (
+          <button key={c} onClick={() => setF({ ...f, color: c })} className={"w-8 h-8 rounded-full " + (f.color === c ? "ring-2 ring-offset-2 ring-indigo-500 dark:ring-offset-zinc-900" : "")} style={{ backgroundColor: c }} />
+        ))}</div>
+      </Field>
+      <Field label="Estatus">
+        <Select value={f.estatus} onChange={set("estatus")}><option value="activo">Activo</option><option value="cerrado">Terminada</option><option value="archivado">Archivado</option></Select>
+      </Field>
+      <Field label="Bitácora / notas"><textarea value={f.notas || ""} onChange={set("notas")} rows={3} className={inputCls} placeholder="Observaciones de la obra…" /></Field>
+    </Sheet>
+  );
+}
+
+function PartidaForm({ ctx, proyecto_id, onClose }) {
+  const { data, reload, showToast } = ctx;
+  const [f, setF] = useState({ proyecto_id, proveedor_id: data.proveedores[0]?.id || "", categoria_id: data.categorias.find((c) => c.tipo === "egreso")?.id || "", concepto: "", presupuesto: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = async () => {
+    if (!f.proveedor_id) return showToast("Elige proveedor");
+    await db.addPartida({ ...f, presupuesto: Number(f.presupuesto) || 0 });
+    await reload(); onClose(); showToast("Partida agregada");
+  };
+  return (
+    <Sheet open onClose={onClose} title="Nueva partida" footer={<Btn onClick={save}>Agregar</Btn>}>
+      <Field label="Proveedor"><Select value={f.proveedor_id} onChange={set("proveedor_id")}>{data.proveedores.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}</Select></Field>
+      <Field label="Rubro"><Select value={f.categoria_id} onChange={set("categoria_id")}>{data.categorias.filter((c) => c.tipo === "egreso").map((c) => <option key={c.id} value={c.id}>{c.icono} {c.nombre}</option>)}</Select></Field>
+      <Field label="Concepto"><TextInput value={f.concepto} onChange={set("concepto")} placeholder="Ej. Puertas y clósets" /></Field>
+      <Field label="Presupuesto"><TextInput type="number" inputMode="decimal" value={f.presupuesto} onChange={set("presupuesto")} placeholder="0.00" /></Field>
+    </Sheet>
+  );
+}
+
+/* ----------------------------- MOVIMIENTOS -------------------------------- */
+function Movimientos({ ctx }) {
+  const { data, setEditMov, removeMov } = ctx;
+  const [q, setQ] = useState("");
+  const [fProy, setFProy] = useState("");
+  const [fTipo, setFTipo] = useState("");
+  const [fEstatus, setFEstatus] = useState("");
+
+  const list = useMemo(() => {
+    return data.movimientos
+      .filter((m) => (!fProy || m.proyecto_id === fProy) && (!fTipo || m.tipo === fTipo) && (!fEstatus || m.estatus === fEstatus))
+      .filter((m) => { if (!q) return true; const prov = data.proveedores.find((p) => p.id === m.proveedor_id); const t = (m.descripcion + " " + (prov?.nombre || "") + " " + (m.etapa || "")).toLowerCase(); return t.includes(q.toLowerCase()); })
+      .sort((a, b) => b.fecha.localeCompare(a.fecha));
+  }, [data, q, fProy, fTipo, fEstatus]);
+
+  return (
+    <div>
+      <Header title="Movimientos" />
+      <div className="px-4 space-y-3">
+        <TextInput value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar proveedor, concepto…" />
+        <div className="flex gap-2 overflow-x-auto pb-1 -mx-4 px-4">
+          <Select value={fProy} onChange={(e) => setFProy(e.target.value)}><option value="">Todas las obras</option>{data.proyectos.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}</Select>
+          <Select value={fTipo} onChange={(e) => setFTipo(e.target.value)}><option value="">Tipo</option><option value="ingreso">Ingreso</option><option value="egreso">Egreso</option></Select>
+          <Select value={fEstatus} onChange={(e) => setFEstatus(e.target.value)}><option value="">Estatus</option><option value="pagado">Pagado</option><option value="pendiente">Pendiente</option><option value="programado">Programado</option></Select>
+        </div>
+        {list.length === 0 ? <Empty title="Sin movimientos" hint="Usa el botón + para registrar uno." /> : (
+          <div className="space-y-2">
+            {list.map((m) => {
+              const obra = data.proyectos.find((o) => o.id === m.proyecto_id);
+              const prov = data.proveedores.find((p) => p.id === m.proveedor_id);
+              const cat = data.categorias.find((c) => c.id === m.categoria_id);
+              return (
+                <Card key={m.id} className="p-3 flex items-center gap-3" onClick={() => setEditMov(m)}>
+                  <div className="w-9 h-9 rounded-xl grid place-items-center text-lg shrink-0" style={{ backgroundColor: (cat?.color || "#999") + "22" }}>{cat?.icono || (m.tipo === "ingreso" ? "💵" : "💸")}</div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-medium truncate">{prov?.nombre || cat?.nombre || (m.tipo === "ingreso" ? "Cobro" : "Egreso")} {m.etapa && <span className="text-zinc-400 font-normal">· {m.etapa}</span>}</p>
+                    <p className="text-xs text-zinc-500 truncate">{obra?.nombre} · {fmtDate(m.fecha)}{m.estatus !== "pagado" ? " · " + m.estatus : ""}</p>
+                  </div>
+                  <span className={"num font-semibold " + (m.tipo === "ingreso" ? "text-emerald-600 dark:text-emerald-400" : "text-rose-600 dark:text-rose-400")}>{m.tipo === "ingreso" ? "+" : "−"}{fmtMXN0(m.monto)}</span>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MovForm({ ctx, mov, onClose, onSave }) {
+  const { data, showToast, removeMov } = ctx;
+  const lastAcc = (() => { try { return localStorage.getItem("obras_last_acc"); } catch { return null; } })();
+  const lastMet = (() => { try { return localStorage.getItem("obras_last_metodo"); } catch { return null; } })();
+  const [f, setF] = useState(mov || {
+    id: uid("mov"),
+    fecha: todayISO(), tipo: "egreso", monto: "", metodo_pago: lastMet || "transferencia",
+    cuenta_id: lastAcc || data.cuentas[0]?.id || "", proyecto_id: data.proyectos[0]?.id || "",
+    partida_id: "", proveedor_id: "", categoria_id: "", etapa: "avance", descripcion: "", estatus: "pagado", creado_en: todayISO(),
+  });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const partidasObra = data.partidas.filter((p) => p.proyecto_id === f.proyecto_id);
+
+  // Adjuntos (fotos/recibos)
+  const [fotos, setFotos] = useState([]);   // existentes {id, dataUrl}
+  const [nuevas, setNuevas] = useState([]); // dataUrls nuevos pendientes
+  const [borrar, setBorrar] = useState([]); // ids existentes a borrar
+  const [subiendo, setSubiendo] = useState(false);
+  useEffect(() => { (async () => { if (mov) { try { setFotos(await db.getAdjuntosByMov(mov.id)); } catch {} } })(); }, [mov]);
+  const onFile = async (e) => {
+    const files = Array.from(e.target.files || []); if (!files.length) return;
+    setSubiendo(true);
+    try { for (const file of files) { const url = await fileToDataUrl(file); setNuevas((n) => [...n, url]); } } catch {}
+    setSubiendo(false); if (e.target) e.target.value = "";
+  };
+
+  // al elegir partida, autollenar proveedor y categoría
+  const onPartida = (e) => {
+    const pid = e.target.value;
+    const p = data.partidas.find((x) => x.id === pid);
+    setF({ ...f, partida_id: pid, proveedor_id: p?.proveedor_id || f.proveedor_id, categoria_id: p?.categoria_id || f.categoria_id });
+  };
+
+  const save = () => {
+    if (!f.monto || Number(f.monto) <= 0) return showToast("Captura el monto");
+    if (!f.proyecto_id) return showToast("Elige la obra");
+    const obj = {
+      ...f, monto: Number(f.monto),
+      partida_id: f.tipo === "egreso" ? (f.partida_id || null) : null,
+      proveedor_id: f.tipo === "egreso" ? (f.proveedor_id || null) : null,
+      categoria_id: f.categoria_id || (f.tipo === "ingreso" ? "cat_cobro" : null),
+      etapa: f.etapa || null,
+      creado_en: f.creado_en || todayISO(),
+    };
+    onSave(obj, { nuevas, borrar });
+  };
+
+  return (
+    <Sheet open onClose={onClose} title={mov ? "Editar movimiento" : "Nuevo movimiento"}
+      footer={<div className="space-y-2">
+        <Btn onClick={save}>Guardar</Btn>
+        {mov && <Btn variant="ghost" onClick={() => notaPDF(mov, data)}>🧾 Exportar nota (PDF)</Btn>}
+        {mov && <Btn variant="danger" onClick={() => { removeMov(mov); onClose(); }}>Eliminar</Btn>}
+      </div>}>
+      <div className="mb-3"><Seg value={f.tipo} onChange={(v) => setF({ ...f, tipo: v })} options={[{ value: "egreso", label: "Egreso" }, { value: "ingreso", label: "Ingreso" }]} /></div>
+      <Field label="Monto"><TextInput type="number" inputMode="decimal" value={f.monto} onChange={set("monto")} placeholder="0.00" autoFocus /></Field>
+      <Field label="Obra"><Select value={f.proyecto_id} onChange={(e) => setF({ ...f, proyecto_id: e.target.value, partida_id: "" })}>{data.proyectos.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}</Select></Field>
+
+      {f.tipo === "egreso" ? (
+        <>
+          <Field label="Partida (proveedor)"><Select value={f.partida_id} onChange={onPartida}><option value="">— sin partida —</option>{partidasObra.map((p) => { const prov = data.proveedores.find((x) => x.id === p.proveedor_id); return <option key={p.id} value={p.id}>{prov?.nombre} · {p.concepto}</option>; })}</Select></Field>
+          <Field label="Etapa"><Select value={f.etapa || ""} onChange={set("etapa")}><option value="anticipo">Anticipo</option><option value="avance">Avance</option><option value="finiquito">Finiquito</option><option value="devolucion">Devolución</option></Select></Field>
+        </>
+      ) : (
+        <Field label="Etapa de cobro"><Select value={f.etapa || ""} onChange={set("etapa")}><option value="anticipo">Anticipo</option><option value="avance">Avance</option><option value="finiquito">Finiquito</option></Select></Field>
+      )}
+
+      <div className="grid grid-cols-2 gap-2">
+        <Field label="Forma de pago"><Select value={f.metodo_pago} onChange={set("metodo_pago")}><option value="efectivo">Efectivo</option><option value="transferencia">Transferencia</option><option value="tarjeta">Tarjeta</option><option value="otro">Otro</option></Select></Field>
+        <Field label="Cuenta"><Select value={f.cuenta_id} onChange={set("cuenta_id")}>{data.cuentas.map((c) => <option key={c.id} value={c.id}>{c.nombre}</option>)}</Select></Field>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <Field label="Fecha"><TextInput type="date" value={f.fecha} onChange={set("fecha")} /></Field>
+        <Field label="Estatus"><Select value={f.estatus} onChange={set("estatus")}><option value="pagado">Pagado</option><option value="pendiente">Pendiente</option><option value="programado">Programado</option></Select></Field>
+      </div>
+      <Field label="Descripción (opcional)"><TextInput value={f.descripcion} onChange={set("descripcion")} placeholder="Nota" /></Field>
+
+      <Field label="Fotos / recibos">
+        <div className="flex gap-2 flex-wrap">
+          {fotos.filter((a) => !borrar.includes(a.id)).map((a) => (
+            <div key={a.id} className="relative">
+              <img src={a.dataUrl} alt="recibo" className="w-16 h-16 object-cover rounded-lg border border-zinc-200 dark:border-zinc-700" />
+              <button onClick={() => setBorrar((b) => [...b, a.id])} className="absolute -top-1.5 -right-1.5 bg-rose-600 text-white rounded-full w-5 h-5 text-xs leading-none">×</button>
+            </div>
+          ))}
+          {nuevas.map((u, i) => (
+            <div key={"n" + i} className="relative">
+              <img src={u} alt="nuevo" className="w-16 h-16 object-cover rounded-lg border border-indigo-300" />
+              <button onClick={() => setNuevas((n) => n.filter((_, j) => j !== i))} className="absolute -top-1.5 -right-1.5 bg-rose-600 text-white rounded-full w-5 h-5 text-xs leading-none">×</button>
+            </div>
+          ))}
+          <label className="w-16 h-16 rounded-lg bg-zinc-100 dark:bg-zinc-800 grid place-items-center text-2xl text-zinc-400 cursor-pointer">
+            +<input type="file" accept="image/*" capture="environment" multiple className="hidden" onChange={onFile} />
+          </label>
+        </div>
+        {subiendo && <p className="text-xs text-zinc-500 mt-1">Procesando imagen…</p>}
+      </Field>
+    </Sheet>
+  );
+}
+
+/* ----------------------------- CALENDARIO --------------------------------- */
+function Pagos({ ctx }) {
+  const { data, marcarPagado, marcarCobrado } = ctx;
+  const [modo, setModo] = useState("pagar"); // pagar | cobrar
+  const [showNew, setShowNew] = useState(false);
+  const [editItem, setEditItem] = useState(null);
+
+  const pagarPend = data.pagos_programados.filter((p) => p.estatus === "pendiente").sort((a, b) => a.fecha_vencimiento.localeCompare(b.fecha_vencimiento));
+  const pagarDone = data.pagos_programados.filter((p) => p.estatus === "pagado").sort((a, b) => b.fecha_vencimiento.localeCompare(a.fecha_vencimiento));
+  const cobrarPend = data.cobros_programados.filter((c) => c.estatus === "pendiente").sort((a, b) => a.fecha_vencimiento.localeCompare(b.fecha_vencimiento));
+  const cobrarDone = data.cobros_programados.filter((c) => c.estatus === "cobrado").sort((a, b) => b.fecha_vencimiento.localeCompare(a.fecha_vencimiento));
+
+  const rowPago = (p) => {
+    const prov = data.proveedores.find((x) => x.id === p.proveedor_id);
+    const obra = data.proyectos.find((x) => x.id === p.proyecto_id);
+    const vencido = p.estatus === "pendiente" && p.fecha_vencimiento < todayISO();
+    const pronto = p.estatus === "pendiente" && !vencido && p.fecha_vencimiento <= isoFrom(7);
+    return (
+      <Card key={p.id} className="p-3.5 flex items-center justify-between">
+        <div className="flex-1 min-w-0" onClick={() => setEditItem(p)}>
+          <p className="font-medium truncate">{prov?.nombre || "Pago"} <span className="text-zinc-400 font-normal text-sm">· {obra?.nombre}</span></p>
+          <p className={"text-xs " + (vencido ? "text-rose-600 dark:text-rose-400 font-medium" : pronto ? "text-amber-600 dark:text-amber-400" : "text-zinc-500")}>
+            {vencido ? "⚠️ Vencido · " : ""}{fmtDate(p.fecha_vencimiento)}{p.recurrencia !== "unica" ? " · " + p.recurrencia : ""}
+          </p>
+        </div>
+        <div className="text-right ml-3 shrink-0">
+          <p className="num font-semibold">{fmtMXN0(p.monto)}</p>
+          {p.estatus === "pendiente"
+            ? <button onClick={() => marcarPagado(p)} className="text-[11px] text-indigo-600 dark:text-indigo-400 font-medium">Marcar pagado</button>
+            : <span className="text-[11px] text-emerald-600 dark:text-emerald-400">Pagado</span>}
+        </div>
+      </Card>
+    );
+  };
+  const rowCobro = (c) => {
+    const obra = data.proyectos.find((x) => x.id === c.proyecto_id);
+    const vencido = c.estatus === "pendiente" && c.fecha_vencimiento < todayISO();
+    const pronto = c.estatus === "pendiente" && !vencido && c.fecha_vencimiento <= isoFrom(7);
+    return (
+      <Card key={c.id} className="p-3.5 flex items-center justify-between">
+        <div className="flex-1 min-w-0" onClick={() => setEditItem(c)}>
+          <p className="font-medium truncate">{clienteNombre(obra, data)} <span className="text-zinc-400 font-normal text-sm">· {obra?.nombre}</span></p>
+          <p className={"text-xs " + (vencido ? "text-rose-600 dark:text-rose-400 font-medium" : pronto ? "text-amber-600 dark:text-amber-400" : "text-zinc-500")}>
+            {vencido ? "⚠️ Vencido · " : ""}{fmtDate(c.fecha_vencimiento)}{c.etapa ? " · " + c.etapa : ""}{c.recurrencia !== "unica" ? " · " + c.recurrencia : ""}
+          </p>
+        </div>
+        <div className="text-right ml-3 shrink-0">
+          <p className="num font-semibold">{fmtMXN0(c.monto)}</p>
+          {c.estatus === "pendiente"
+            ? <button onClick={() => marcarCobrado(c)} className="text-[11px] text-indigo-600 dark:text-indigo-400 font-medium">Marcar cobrado</button>
+            : <span className="text-[11px] text-emerald-600 dark:text-emerald-400">Cobrado</span>}
+        </div>
+      </Card>
+    );
+  };
+
+  const esPagar = modo === "pagar";
+  return (
+    <div>
+      <Header title="Calendario" right={<button onClick={() => setShowNew(true)} className="text-indigo-600 dark:text-indigo-400 font-medium text-sm">+ Nuevo</button>} />
+      <div className="px-4 space-y-3">
+        <Seg value={modo} onChange={setModo} options={[{ value: "pagar", label: "Por pagar" }, { value: "cobrar", label: "Por cobrar" }]} />
+        {esPagar ? (
+          <>
+            {pagarPend.length === 0 && pagarDone.length === 0 && <Empty icon="📅" title="Sin pagos programados" hint="Agenda lo que debes a proveedores." action={<Btn onClick={() => setShowNew(true)}>Programar pago</Btn>} />}
+            {pagarPend.length > 0 && <p className="text-xs font-medium text-zinc-500 px-1">Pendientes</p>}
+            {pagarPend.map(rowPago)}
+            {pagarDone.length > 0 && <p className="text-xs font-medium text-zinc-500 px-1 pt-2">Pagados</p>}
+            {pagarDone.map(rowPago)}
+          </>
+        ) : (
+          <>
+            {cobrarPend.length === 0 && cobrarDone.length === 0 && <Empty icon="💰" title="Sin cobros programados" hint="Agenda los avances y finiquitos que te deben." action={<Btn onClick={() => setShowNew(true)}>Programar cobro</Btn>} />}
+            {cobrarPend.length > 0 && <p className="text-xs font-medium text-zinc-500 px-1">Por cobrar</p>}
+            {cobrarPend.map(rowCobro)}
+            {cobrarDone.length > 0 && <p className="text-xs font-medium text-zinc-500 px-1 pt-2">Cobrados</p>}
+            {cobrarDone.map(rowCobro)}
+          </>
+        )}
+      </div>
+      {(showNew || editItem) && (esPagar
+        ? <PagoForm ctx={ctx} pago={editItem} onClose={() => { setShowNew(false); setEditItem(null); }} />
+        : <CobroForm ctx={ctx} cobro={editItem} onClose={() => { setShowNew(false); setEditItem(null); }} />)}
+    </div>
+  );
+}
+
+function PagoForm({ ctx, pago, onClose }) {
+  const { data, reload, showToast } = ctx;
+  const [f, setF] = useState(pago || { proyecto_id: data.proyectos[0]?.id || "", partida_id: "", proveedor_id: "", monto: "", fecha_vencimiento: isoFrom(7), recurrencia: "unica", estatus: "pendiente", movimiento_id: null });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const partidasObra = data.partidas.filter((p) => p.proyecto_id === f.proyecto_id);
+  const onPartida = (e) => { const p = data.partidas.find((x) => x.id === e.target.value); setF({ ...f, partida_id: e.target.value, proveedor_id: p?.proveedor_id || "" }); };
+  const save = async () => {
+    if (!f.monto || Number(f.monto) <= 0) return showToast("Captura el monto");
+    const obj = { ...f, monto: Number(f.monto) };
+    if (obj.id) await db.updatePagoProgramado(obj); else await db.addPagoProgramado(obj);
+    await reload(); onClose(); showToast(obj.id ? "Pago actualizado" : "Pago programado");
+  };
+  const del = async () => { await db.deletePagoProgramado(f.id); await reload(); onClose(); showToast("Pago eliminado"); };
+  return (
+    <Sheet open onClose={onClose} title={pago ? "Editar pago" : "Programar pago"}
+      footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{pago && <Btn variant="danger" onClick={del}>Eliminar</Btn>}</div>}>
+      <Field label="Obra"><Select value={f.proyecto_id} onChange={(e) => setF({ ...f, proyecto_id: e.target.value, partida_id: "" })}>{data.proyectos.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}</Select></Field>
+      <Field label="Partida (proveedor)"><Select value={f.partida_id} onChange={onPartida}><option value="">— elige —</option>{partidasObra.map((p) => { const prov = data.proveedores.find((x) => x.id === p.proveedor_id); return <option key={p.id} value={p.id}>{prov?.nombre} · {p.concepto}</option>; })}</Select></Field>
+      <Field label="Monto"><TextInput type="number" inputMode="decimal" value={f.monto} onChange={set("monto")} placeholder="0.00" /></Field>
+      <div className="grid grid-cols-2 gap-2">
+        <Field label="Vence"><TextInput type="date" value={f.fecha_vencimiento} onChange={set("fecha_vencimiento")} /></Field>
+        <Field label="Recurrencia"><Select value={f.recurrencia} onChange={set("recurrencia")}><option value="unica">Única</option><option value="semanal">Semanal</option><option value="quincenal">Quincenal</option><option value="mensual">Mensual</option></Select></Field>
+      </div>
+    </Sheet>
+  );
+}
+
+function CobroForm({ ctx, cobro, onClose }) {
+  const { data, reload, showToast } = ctx;
+  const [f, setF] = useState(cobro || { proyecto_id: data.proyectos[0]?.id || "", cliente_id: "", etapa: "avance", monto: "", fecha_vencimiento: isoFrom(7), recurrencia: "unica", estatus: "pendiente", movimiento_id: null });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const onObra = (e) => { const o = data.proyectos.find((x) => x.id === e.target.value); setF({ ...f, proyecto_id: e.target.value, cliente_id: o?.cliente_id || f.cliente_id }); };
+  const save = async () => {
+    if (!f.monto || Number(f.monto) <= 0) return showToast("Captura el monto");
+    const obj = { ...f, monto: Number(f.monto), cliente_id: f.cliente_id || null };
+    if (obj.id) await db.updateCobroProgramado(obj); else await db.addCobroProgramado(obj);
+    await reload(); onClose(); showToast(obj.id ? "Cobro actualizado" : "Cobro programado");
+  };
+  const del = async () => { await db.deleteCobroProgramado(f.id); await reload(); onClose(); showToast("Cobro eliminado"); };
+  return (
+    <Sheet open onClose={onClose} title={cobro ? "Editar cobro" : "Programar cobro"}
+      footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{cobro && <Btn variant="danger" onClick={del}>Eliminar</Btn>}</div>}>
+      <Field label="Obra"><Select value={f.proyecto_id} onChange={onObra}>{data.proyectos.map((p) => <option key={p.id} value={p.id}>{p.nombre}</option>)}</Select></Field>
+      <Field label="Cliente"><Select value={f.cliente_id || ""} onChange={set("cliente_id")}><option value="">— el de la obra —</option>{data.clientes.map((c) => <option key={c.id} value={c.id}>{c.nombre}</option>)}</Select></Field>
+      <Field label="Etapa"><Select value={f.etapa} onChange={set("etapa")}><option value="anticipo">Anticipo</option><option value="avance">Avance</option><option value="finiquito">Finiquito</option></Select></Field>
+      <Field label="Monto"><TextInput type="number" inputMode="decimal" value={f.monto} onChange={set("monto")} placeholder="0.00" /></Field>
+      <div className="grid grid-cols-2 gap-2">
+        <Field label="Vence"><TextInput type="date" value={f.fecha_vencimiento} onChange={set("fecha_vencimiento")} /></Field>
+        <Field label="Recurrencia"><Select value={f.recurrencia} onChange={set("recurrencia")}><option value="unica">Única</option><option value="semanal">Semanal</option><option value="quincenal">Quincenal</option><option value="mensual">Mensual</option></Select></Field>
+      </div>
+    </Sheet>
+  );
+}
+
+/* ------------------------------ PROVEEDORES ------------------------------- */
+function Proveedores({ ctx }) {
+  const { data, derived, back, go } = ctx;
+  const [edit, setEdit] = useState(null);
+  const [showNew, setShowNew] = useState(false);
+  const totalProv = (id) => data.movimientos.filter((m) => m.proveedor_id === id && m.tipo === "egreso" && m.estatus === "pagado").reduce((a, m) => a + Number(m.monto || 0), 0);
+  return (
+    <div>
+      <Header title="Proveedores" onBack={back} right={<button onClick={() => setShowNew(true)} className="text-indigo-600 dark:text-indigo-400 text-sm font-medium">+ Nuevo</button>} />
+      <div className="px-4 space-y-2">
+        {data.proveedores.map((p) => (
+          <Card key={p.id} className="p-3.5 flex items-center justify-between" onClick={() => go("proveedor", p.id)}>
+            <div><p className="font-medium">{p.nombre}</p>{p.notas && <p className="text-xs text-zinc-500">{p.notas}</p>}</div>
+            <div className="text-right"><p className="text-[11px] text-zinc-400">Pagado</p><p className="num font-semibold text-sm">{fmtMXN0(totalProv(p.id))}</p></div>
+          </Card>
+        ))}
+      </div>
+      {(showNew || edit) && <ProveedorForm ctx={ctx} prov={edit} onClose={() => { setShowNew(false); setEdit(null); }} />}
+    </div>
+  );
+}
+function ProveedorDetail({ ctx, id }) {
+  const { data, derived, back } = ctx;
+  const prov = data.proveedores.find((p) => p.id === id);
+  const [edit, setEdit] = useState(false);
+  if (!prov) return <div className="p-6">No encontrado. <button onClick={back} className="text-indigo-600">Volver</button></div>;
+  const movs = data.movimientos.filter((m) => m.proveedor_id === id && m.estatus === "pagado").sort((a, b) => b.fecha.localeCompare(a.fecha));
+  const total = movs.reduce((a, m) => a + Number(m.monto || 0), 0);
+  const partidas = data.partidas.filter((p) => p.proveedor_id === id);
+  return (
+    <div>
+      <Header title={prov.nombre} onBack={back} right={<button onClick={() => setEdit(true)} className="text-sm text-indigo-600 dark:text-indigo-400">Editar</button>} />
+      <div className="px-4 space-y-4">
+        <Card className="p-4"><p className="text-xs text-zinc-500">Total pagado</p><p className="text-2xl font-bold num mt-1">{fmtMXN0(total)}</p>{prov.telefono && <p className="text-sm text-zinc-500 mt-2">📞 {prov.telefono}</p>}</Card>
+        <Card className="p-4">
+          <p className="font-semibold mb-2">Partidas por obra</p>
+          {partidas.length === 0 ? <p className="text-sm text-zinc-500">Sin partidas asignadas.</p> : partidas.map((p) => {
+            const obra = data.proyectos.find((o) => o.id === p.proyecto_id); const ps = derived.partidaStats[p.id] || {};
+            return <div key={p.id} className="flex justify-between text-sm py-0.5"><span>{obra?.nombre} <span className="text-zinc-400">· {p.concepto}</span></span><Money value={ps.diferencial} sign className="text-xs" /></div>;
+          })}
+        </Card>
+        <Card className="p-4">
+          <p className="font-semibold mb-2">Historial de pagos</p>
+          {movs.length === 0 ? <p className="text-sm text-zinc-500">Sin pagos.</p> : movs.map((m) => { const o = data.proyectos.find((x) => x.id === m.proyecto_id); return <div key={m.id} className="flex justify-between text-sm py-0.5"><span>{o?.nombre} <span className="text-zinc-400">· {fmtDate(m.fecha)}</span></span><span className="num">{fmtMXN0(m.monto)}</span></div>; })}
+        </Card>
+      </div>
+      {edit && <ProveedorForm ctx={ctx} prov={prov} onClose={() => setEdit(false)} />}
+    </div>
+  );
+}
+function ProveedorForm({ ctx, prov, onClose }) {
+  const { reload, showToast, back } = ctx;
+  const [f, setF] = useState(prov || { nombre: "", telefono: "", contacto: "", email: "", notas: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = async () => { if (!f.nombre) return showToast("Nombre requerido"); if (f.id) await db.updateProveedor(f); else await db.addProveedor(f); await reload(); onClose(); showToast("Guardado"); };
+  const del = async () => { await db.deleteProveedor(f.id); await reload(); onClose(); back(); showToast("Proveedor eliminado"); };
+  return (
+    <Sheet open onClose={onClose} title={prov ? "Editar proveedor" : "Nuevo proveedor"} footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{prov && <Btn variant="danger" onClick={del}>Eliminar</Btn>}</div>}>
+      <Field label="Nombre"><TextInput value={f.nombre} onChange={set("nombre")} /></Field>
+      <Field label="Teléfono"><TextInput value={f.telefono} onChange={set("telefono")} inputMode="tel" /></Field>
+      <Field label="Notas / especialidad"><TextInput value={f.notas} onChange={set("notas")} /></Field>
+    </Sheet>
+  );
+}
+
+/* ------------------------------ CATEGORÍAS -------------------------------- */
+function Categorias({ ctx }) {
+  const { data, reload, showToast, back } = ctx;
+  const [edit, setEdit] = useState(null);
+  const grupos = [["egreso", "Egresos (rubros)"], ["ingreso", "Ingresos"]];
+  return (
+    <div>
+      <Header title="Categorías / Rubros" onBack={back} right={<button onClick={() => setEdit({ nombre: "", tipo: "egreso", color: PROYECTO_COLORS[0], icono: "📦" })} className="text-indigo-600 dark:text-indigo-400 text-sm font-medium">+ Nueva</button>} />
+      <div className="px-4 space-y-4">
+        {grupos.map(([tipo, label]) => (
+          <div key={tipo}>
+            <p className="text-xs font-medium text-zinc-500 mb-1 px-1">{label}</p>
+            <Card className="divide-y divide-zinc-100 dark:divide-zinc-800">
+              {data.categorias.filter((c) => c.tipo === tipo).map((c) => (
+                <div key={c.id} className="p-3 flex items-center gap-3" onClick={() => setEdit(c)}>
+                  <span className="w-8 h-8 grid place-items-center rounded-lg text-lg" style={{ backgroundColor: c.color + "22" }}>{c.icono}</span>
+                  <span className="flex-1 font-medium">{c.nombre}</span>
+                  <span className="w-3 h-3 rounded-full" style={{ backgroundColor: c.color }} />
+                </div>
+              ))}
+            </Card>
+          </div>
+        ))}
+      </div>
+      {edit && <CategoriaForm ctx={ctx} cat={edit.id ? edit : null} init={edit} onClose={() => setEdit(null)} />}
+    </div>
+  );
+}
+function CategoriaForm({ ctx, cat, init, onClose }) {
+  const { reload, showToast } = ctx;
+  const [f, setF] = useState(cat || init);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = async () => { if (!f.nombre) return showToast("Nombre requerido"); if (f.id) await db.updateCategoria(f); else await db.addCategoria(f); await reload(); onClose(); showToast("Guardado"); };
+  const del = async () => { await db.deleteCategoria(f.id); await reload(); onClose(); showToast("Eliminada"); };
+  return (
+    <Sheet open onClose={onClose} title={cat ? "Editar categoría" : "Nueva categoría"} footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{cat && <Btn variant="danger" onClick={del}>Eliminar</Btn>}</div>}>
+      <Field label="Nombre"><TextInput value={f.nombre} onChange={set("nombre")} /></Field>
+      <Field label="Tipo"><Select value={f.tipo} onChange={set("tipo")}><option value="egreso">Egreso</option><option value="ingreso">Ingreso</option></Select></Field>
+      <Field label="Ícono (emoji)"><TextInput value={f.icono} onChange={set("icono")} maxLength={2} /></Field>
+      <Field label="Color"><div className="flex gap-2 flex-wrap">{PROYECTO_COLORS.map((c) => <button key={c} onClick={() => setF({ ...f, color: c })} className={"w-8 h-8 rounded-full " + (f.color === c ? "ring-2 ring-offset-2 ring-indigo-500 dark:ring-offset-zinc-900" : "")} style={{ backgroundColor: c }} />)}</div></Field>
+    </Sheet>
+  );
+}
+
+/* -------------------------------- CUENTAS --------------------------------- */
+function Cuentas({ ctx }) {
+  const { data, derived, back } = ctx;
+  const [edit, setEdit] = useState(null);
+  return (
+    <div>
+      <Header title="Cuentas" onBack={back} right={<button onClick={() => setEdit({ nombre: "", tipo: "banco", saldo_inicial: "" })} className="text-indigo-600 dark:text-indigo-400 text-sm font-medium">+ Nueva</button>} />
+      <div className="px-4 space-y-2">
+        {data.cuentas.map((c) => (
+          <Card key={c.id} className="p-4 flex items-center justify-between" onClick={() => setEdit(c)}>
+            <div><p className="font-medium">{c.nombre}</p><p className="text-xs text-zinc-500 capitalize">{c.tipo}</p></div>
+            <p className="num font-bold">{fmtMXN(derived.cuentaStats[c.id]?.saldo || 0)}</p>
+          </Card>
+        ))}
+      </div>
+      {edit && <CuentaForm ctx={ctx} cuenta={edit.id ? edit : null} init={edit} onClose={() => setEdit(null)} />}
+    </div>
+  );
+}
+function CuentaForm({ ctx, cuenta, init, onClose }) {
+  const { reload, showToast } = ctx;
+  const [f, setF] = useState(cuenta || init);
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = async () => { if (!f.nombre) return showToast("Nombre requerido"); const o = { ...f, saldo_inicial: Number(f.saldo_inicial) || 0 }; if (o.id) await db.updateCuenta(o); else await db.addCuenta(o); await reload(); onClose(); showToast("Guardado"); };
+  const del = async () => { await db.deleteCuenta(f.id); await reload(); onClose(); showToast("Eliminada"); };
+  return (
+    <Sheet open onClose={onClose} title={cuenta ? "Editar cuenta" : "Nueva cuenta"} footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{cuenta && <Btn variant="danger" onClick={del}>Eliminar</Btn>}</div>}>
+      <Field label="Nombre"><TextInput value={f.nombre} onChange={set("nombre")} placeholder="BBVA / Efectivo" /></Field>
+      <Field label="Tipo"><Select value={f.tipo} onChange={set("tipo")}><option value="banco">Banco</option><option value="efectivo">Efectivo</option></Select></Field>
+      <Field label="Saldo inicial"><TextInput type="number" inputMode="decimal" value={f.saldo_inicial} onChange={set("saldo_inicial")} /></Field>
+    </Sheet>
+  );
+}
+
+/* -------------------------------- REPORTES -------------------------------- */
+function Reportes({ ctx }) {
+  const { data, derived, back } = ctx;
+  const exportCSV = () => {
+    const rows = [["Fecha", "Tipo", "Obra", "Proveedor", "Rubro", "Etapa", "Forma de pago", "Cuenta", "Estatus", "Monto", "Descripción"]];
+    data.movimientos.slice().sort((a, b) => a.fecha.localeCompare(b.fecha)).forEach((m) => {
+      const o = data.proyectos.find((x) => x.id === m.proyecto_id);
+      const p = data.proveedores.find((x) => x.id === m.proveedor_id);
+      const c = data.categorias.find((x) => x.id === m.categoria_id);
+      rows.push([m.fecha, m.tipo, o?.nombre || "", p?.nombre || "", c?.nombre || "", m.etapa || "", m.metodo_pago, (data.cuentas.find((x) => x.id === m.cuenta_id) || {}).nombre || "", m.estatus, m.monto, (m.descripcion || "").replace(/[\n;]/g, " ")]);
+    });
+    const csv = rows.map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `movimientos_${todayISO()}.csv`; a.click();
+  };
+  return (
+    <div>
+      <Header title="Reportes" onBack={back} />
+      <div className="px-4 space-y-4">
+        <Card className="p-4">
+          <p className="font-semibold mb-3">Resumen por obra</p>
+          <div className="space-y-2">
+            {data.proyectos.map((o) => { const s = derived.obraStats[o.id] || {}; return (
+              <div key={o.id} className="flex justify-between text-sm">
+                <span>{o.nombre}</span>
+                <span className="num">Util. <Money value={s.utilidad} sign className="text-sm" /></span>
+              </div>
+            ); })}
+            <div className="flex justify-between text-sm font-semibold pt-2 border-t border-zinc-100 dark:border-zinc-800">
+              <span>Utilidad total</span><Money value={derived.utilidadTotal} sign className="text-sm" />
+            </div>
+          </div>
+        </Card>
+        <Btn onClick={exportCSV}>⬇️ Exportar movimientos a CSV</Btn>
+        <p className="text-xs text-zinc-500 text-center">El CSV abre en Excel/Numbers con acentos correctos.</p>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------- MÁS ----------------------------------- */
+function Mas({ ctx, dark, setDark }) {
+  const { go, reload, showToast, pin, setPin } = ctx;
+  const fileRef = useRef(null);
+  const [pinSheet, setPinSheet] = useState(false);
+  const items = [
+    { l: "Clientes", i: "🧑‍💼", s: "clientes" },
+    { l: "Proveedores", i: "👷", s: "proveedores" },
+    { l: "Categorías / Rubros", i: "🏷️", s: "categorias" },
+    { l: "Cuentas", i: "🏦", s: "cuentas" },
+    { l: "Reportes y CSV", i: "📑", s: "reportes" },
+  ];
+  const exportBackup = async () => {
+    try {
+      const dump = await db.exportAll();
+      downloadFile(`respaldo_obras_${todayISO()}.json`, JSON.stringify(dump), "application/json");
+      showToast("Respaldo descargado");
+    } catch { showToast("No se pudo exportar"); }
+  };
+  const onImport = async (e) => {
+    const file = (e.target.files || [])[0]; if (!file) return;
+    if (!confirm("Restaurar este respaldo REEMPLAZA todos los datos actuales. ¿Continuar?")) { e.target.value = ""; return; }
+    try {
+      const txt = await file.text();
+      await db.importAll(JSON.parse(txt));
+      await reload(); showToast("Respaldo restaurado ✓");
+    } catch { showToast("Archivo inválido"); }
+    e.target.value = "";
+  };
+  return (
+    <div>
+      <Header title="Más" />
+      <div className="px-4 space-y-4">
+        <Card className="divide-y divide-zinc-100 dark:divide-zinc-800">
+          {items.map((it) => (
+            <button key={it.s} onClick={() => go(it.s)} className="w-full p-4 flex items-center gap-3 text-left">
+              <span className="text-xl">{it.i}</span><span className="flex-1 font-medium">{it.l}</span><span className="text-zinc-300 dark:text-zinc-600">›</span>
+            </button>
+          ))}
+        </Card>
+
+        <Card className="p-4 flex items-center justify-between">
+          <span className="font-medium">🌙 Modo oscuro</span>
+          <button onClick={() => setDark(!dark)} className={"w-12 h-7 rounded-full transition-colors relative " + (dark ? "bg-indigo-600" : "bg-zinc-300")}>
+            <span className={"absolute top-0.5 w-6 h-6 bg-white rounded-full transition-transform " + (dark ? "translate-x-5" : "translate-x-0.5")} />
+          </button>
+        </Card>
+
+        {/* Respaldo / restauración */}
+        <Card className="p-4 space-y-3">
+          <div>
+            <p className="text-sm font-medium">Respaldo</p>
+            <p className="text-xs text-zinc-500">Tus datos viven en este dispositivo. Baja un respaldo seguido para no perderlos.</p>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <Btn variant="ghost" onClick={exportBackup}>⬇️ Exportar</Btn>
+            <Btn variant="ghost" onClick={() => fileRef.current && fileRef.current.click()}>⬆️ Restaurar</Btn>
+          </div>
+          <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={onImport} />
+        </Card>
+
+        {/* Seguridad / PIN */}
+        <Card className="p-4 flex items-center justify-between">
+          <div>
+            <p className="font-medium">🔒 Bloqueo con PIN</p>
+            <p className="text-xs text-zinc-500">{pin ? "Activado" : "Desactivado"}</p>
+          </div>
+          <button onClick={() => setPinSheet(true)} className="text-sm text-indigo-600 dark:text-indigo-400 font-medium">{pin ? "Cambiar / quitar" : "Activar"}</button>
+        </Card>
+
+        {/* Datos */}
+        <Card className="p-4 space-y-2">
+          <p className="text-sm font-medium">Datos</p>
+          <button onClick={async () => { if (confirm("Cargar datos DEMO? Esto reemplaza lo actual (los catálogos se conservan).")) { await db.loadExample(); await reload(); showToast("Datos de ejemplo cargados"); } }} className="text-sm text-indigo-600 dark:text-indigo-400 block">Cargar datos de ejemplo</button>
+          <button onClick={async () => { if (confirm("Reiniciar a cero? Borra obras y movimientos, conserva cuentas, categorías y proveedores.")) { await db.resetZero(); await reload(); showToast("App en cero"); } }} className="text-sm text-amber-600 dark:text-amber-400 block">Reiniciar a cero (conserva catálogos)</button>
+          <button onClick={async () => { if (confirm("Borrar TODO, incluso catálogos?")) { await db.wipe(); await db.ensureSeed(); await reload(); showToast("Todo borrado"); } }} className="text-sm text-rose-600 dark:text-rose-400 block">Borrar todo</button>
+        </Card>
+
+        <p className="text-xs text-zinc-400 text-center pt-2">Obras · Fase 1 · Datos guardados en tu dispositivo.</p>
+      </div>
+      {pinSheet && <PinSheet pin={pin} setPin={setPin} showToast={showToast} onClose={() => setPinSheet(false)} />}
+    </div>
+  );
+}
+
+function PinSheet({ pin, setPin, showToast, onClose }) {
+  const [v, setV] = useState("");
+  const [v2, setV2] = useState("");
+  const save = () => {
+    if (v.length < 4) return showToast("El PIN debe tener al menos 4 dígitos");
+    if (v !== v2) return showToast("Los PIN no coinciden");
+    setPin(v); onClose(); showToast("PIN activado");
+  };
+  const quitar = () => { setPin(""); onClose(); showToast("PIN desactivado"); };
+  return (
+    <Sheet open onClose={onClose} title={pin ? "Cambiar PIN" : "Activar PIN"}
+      footer={<div className="space-y-2"><Btn onClick={save}>Guardar PIN</Btn>{pin && <Btn variant="danger" onClick={quitar}>Quitar PIN</Btn>}</div>}>
+      <Field label="Nuevo PIN"><TextInput type="password" inputMode="numeric" value={v} onChange={(e) => setV(e.target.value.replace(/\D/g, ""))} placeholder="••••" maxLength={8} /></Field>
+      <Field label="Repetir PIN"><TextInput type="password" inputMode="numeric" value={v2} onChange={(e) => setV2(e.target.value.replace(/\D/g, ""))} placeholder="••••" maxLength={8} /></Field>
+      <p className="text-xs text-zinc-500">Es una traba simple en tu dispositivo, no un cifrado. Para datos críticos usa también el respaldo.</p>
+    </Sheet>
+  );
+}
+
+/* ------------------------------- CLIENTES --------------------------------- */
+function Clientes({ ctx }) {
+  const { data, back } = ctx;
+  const [edit, setEdit] = useState(null);
+  const [showNew, setShowNew] = useState(false);
+  const obrasDe = (id) => data.proyectos.filter((o) => o.cliente_id === id).length;
+  return (
+    <div>
+      <Header title="Clientes" onBack={back} right={<button onClick={() => setShowNew(true)} className="text-indigo-600 dark:text-indigo-400 text-sm font-medium">+ Nuevo</button>} />
+      <div className="px-4 space-y-2">
+        {data.clientes.length === 0 && <Empty icon="🧑‍💼" title="Sin clientes" hint="Agrega clientes para reusarlos en obras y cobros." action={<Btn onClick={() => setShowNew(true)}>Nuevo cliente</Btn>} />}
+        {data.clientes.map((c) => (
+          <Card key={c.id} className="p-3.5 flex items-center justify-between" onClick={() => setEdit(c)}>
+            <div><p className="font-medium">{c.nombre}</p><p className="text-xs text-zinc-500">{[c.telefono, c.email].filter(Boolean).join(" · ") || "Sin contacto"}</p></div>
+            <span className="text-xs text-zinc-400">{obrasDe(c.id)} obras</span>
+          </Card>
+        ))}
+      </div>
+      {(showNew || edit) && <ClienteForm ctx={ctx} cliente={edit} onClose={() => { setShowNew(false); setEdit(null); }} />}
+    </div>
+  );
+}
+function ClienteForm({ ctx, cliente, onClose }) {
+  const { reload, showToast } = ctx;
+  const [f, setF] = useState(cliente || { nombre: "", telefono: "", email: "", notas: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const save = async () => { if (!f.nombre) return showToast("Nombre requerido"); if (f.id) await db.updateCliente(f); else await db.addCliente(f); await reload(); onClose(); showToast("Guardado"); };
+  const del = async () => { await db.deleteCliente(f.id); await reload(); onClose(); showToast("Cliente eliminado"); };
+  return (
+    <Sheet open onClose={onClose} title={cliente ? "Editar cliente" : "Nuevo cliente"} footer={<div className="space-y-2"><Btn onClick={save}>Guardar</Btn>{cliente && <Btn variant="danger" onClick={del}>Eliminar</Btn>}</div>}>
+      <Field label="Nombre"><TextInput value={f.nombre} onChange={set("nombre")} placeholder="Familia Bissu" /></Field>
+      <Field label="Teléfono"><TextInput value={f.telefono} onChange={set("telefono")} inputMode="tel" /></Field>
+      <Field label="Email"><TextInput value={f.email} onChange={set("email")} inputMode="email" /></Field>
+      <Field label="Notas"><textarea value={f.notas || ""} onChange={set("notas")} rows={2} className={inputCls} /></Field>
+    </Sheet>
+  );
+}
+
+/* ----------------------------- BÚSQUEDA GLOBAL ---------------------------- */
+function SearchOverlay({ ctx, onClose }) {
+  const { data, go } = ctx;
+  const [q, setQ] = useState("");
+  const ql = q.trim().toLowerCase();
+  const obras = ql ? data.proyectos.filter((o) => (o.nombre + " " + (o.cliente || "")).toLowerCase().includes(ql)).slice(0, 8) : [];
+  const provs = ql ? data.proveedores.filter((p) => p.nombre.toLowerCase().includes(ql)).slice(0, 8) : [];
+  const clis = ql ? data.clientes.filter((c) => c.nombre.toLowerCase().includes(ql)).slice(0, 8) : [];
+  const movs = ql ? data.movimientos.filter((m) => { const prov = data.proveedores.find((p) => p.id === m.proveedor_id); return ((m.descripcion || "") + " " + (prov?.nombre || "") + " " + (m.etapa || "")).toLowerCase().includes(ql); }).sort((a, b) => b.fecha.localeCompare(a.fecha)).slice(0, 10) : [];
+  const nav = (screen, id) => { onClose(); go(screen, id); };
+  const Row = ({ icon, title, sub, onClick }) => (
+    <button onClick={onClick} className="w-full p-3 flex items-center gap-3 text-left border-b border-zinc-100 dark:border-zinc-800">
+      <span className="text-lg">{icon}</span><div className="flex-1 min-w-0"><p className="font-medium truncate">{title}</p>{sub && <p className="text-xs text-zinc-500 truncate">{sub}</p>}</div>
+    </button>
+  );
+  return (
+    <div className="fixed inset-0 z-50 bg-[#FAFAF8] dark:bg-[#0E0F13] flex flex-col" style={{ paddingTop: "var(--safe-t)" }}>
+      <div className="px-4 py-3 flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800">
+        <TextInput value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar obras, proveedores, clientes, movimientos…" autoFocus />
+        <button onClick={onClose} className="text-sm text-indigo-600 dark:text-indigo-400 font-medium shrink-0">Cerrar</button>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {!ql && <p className="text-center text-sm text-zinc-400 mt-10">Escribe para buscar.</p>}
+        {ql && obras.length === 0 && provs.length === 0 && clis.length === 0 && movs.length === 0 && <p className="text-center text-sm text-zinc-400 mt-10">Sin resultados.</p>}
+        {obras.length > 0 && <p className="text-xs font-medium text-zinc-500 px-4 pt-3 pb-1">Obras</p>}
+        {obras.map((o) => <Row key={o.id} icon="🏗️" title={o.nombre} sub={o.cliente} onClick={() => nav("obra", o.id)} />)}
+        {provs.length > 0 && <p className="text-xs font-medium text-zinc-500 px-4 pt-3 pb-1">Proveedores</p>}
+        {provs.map((p) => <Row key={p.id} icon="👷" title={p.nombre} sub={p.notas} onClick={() => nav("proveedor", p.id)} />)}
+        {clis.length > 0 && <p className="text-xs font-medium text-zinc-500 px-4 pt-3 pb-1">Clientes</p>}
+        {clis.map((c) => <Row key={c.id} icon="🧑‍💼" title={c.nombre} sub={c.telefono || c.email} onClick={() => nav("clientes")} />)}
+        {movs.length > 0 && <p className="text-xs font-medium text-zinc-500 px-4 pt-3 pb-1">Movimientos</p>}
+        {movs.map((m) => { const o = data.proyectos.find((x) => x.id === m.proyecto_id); const prov = data.proveedores.find((x) => x.id === m.proveedor_id); return <Row key={m.id} icon={m.tipo === "ingreso" ? "💵" : "💸"} title={(prov?.nombre || m.descripcion || (m.tipo === "ingreso" ? "Cobro" : "Egreso")) + " · " + fmtMXN0(m.monto)} sub={(o?.nombre || "") + " · " + fmtDate(m.fecha)} onClick={() => nav("obra", m.proyecto_id)} />; })}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------- PIN LOCK --------------------------------- */
+function PinLock({ pin, onUnlock }) {
+  const [v, setV] = useState("");
+  const [err, setErr] = useState(false);
+  const press = (d) => {
+    const nv = (v + d).slice(0, 8); setV(nv); setErr(false);
+    if (nv.length >= pin.length && nv === pin) { setTimeout(onUnlock, 120); }
+    else if (nv.length >= pin.length) { setErr(true); setTimeout(() => { setV(""); setErr(false); }, 500); }
+  };
+  const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "", "0", "⌫"];
+  return (
+    <div className="min-h-screen grid place-items-center bg-[#FAFAF8] dark:bg-[#0E0F13]" style={{ paddingTop: "var(--safe-t)" }}>
+      <div className="w-full max-w-xs px-8 text-center">
+        <div className="text-4xl mb-2">🔒</div>
+        <p className="font-semibold mb-6">Ingresa tu PIN</p>
+        <div className={"flex justify-center gap-3 mb-8 " + (err ? "animate-pulse" : "")}>
+          {Array.from({ length: Math.max(pin.length, 4) }).map((_, i) => (
+            <span key={i} className={"w-3.5 h-3.5 rounded-full " + (i < v.length ? (err ? "bg-rose-500" : "bg-indigo-600") : "bg-zinc-300 dark:bg-zinc-700")} />
+          ))}
+        </div>
+        <div className="grid grid-cols-3 gap-4">
+          {keys.map((k, i) => k === "" ? <span key={i} /> : (
+            <button key={i} onClick={() => k === "⌫" ? setV((s) => s.slice(0, -1)) : press(k)}
+              className="h-16 rounded-2xl bg-white dark:bg-zinc-800 text-2xl font-medium active:bg-zinc-100 dark:active:bg-zinc-700 shadow-sm">{k}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------- mount ---------------------------------- */
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+/* ----------------------------- registrar SW ------------------------------- */
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").then((reg) => {
+      if (reg.waiting && navigator.serviceWorker.controller) window.dispatchEvent(new Event("sw-update"));
+      reg.addEventListener("updatefound", () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener("statechange", () => {
+          if (nw.state === "installed" && navigator.serviceWorker.controller) window.dispatchEvent(new Event("sw-update"));
+        });
+      });
+    }).catch(() => {});
+  });
+}
+  </script>
+</body>
+</html>

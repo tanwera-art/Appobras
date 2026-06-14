@@ -1998,7 +1998,33 @@ if ("serviceWorker" in navigator) {
   const SUPABASE_URL = 'https://tu-proyecto.supabase.co'; 
   const SUPABASE_ANON_KEY = 'tu-clave-anon-super-larga...';
   const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    async function guardarEnAdministracion() {
+  // 1. Jalamos los datos que escribiste en la pantalla
+  const conceptoForm = document.getElementById('concepto').value;
+  const montoForm = document.getElementById('monto').value;
 
+  // Validación rápida para que no envíes cosas vacías
+  if (!conceptoForm || !montoForm) {
+    alert('Por favor, llena todos los campos');
+    return;
+  }
+
+  // 2. Mandamos los datos a Supabase
+  const { data, error } = await supabase
+    .from('administracion') // Así se debe llamar tu tabla en Supabase
+    .insert([
+      { concepto: conceptoForm, monto: parseFloat(montoForm) }
+    ]);
+
+  if (error) {
+    alert('Hubo un error al guardar: ' + error.message);
+  } else {
+    alert('¡Registro administrativo guardado con éxito!');
+    // Limpiamos los campos
+    document.getElementById('concepto').value = '';
+    document.getElementById('monto').value = '';
+  }
+}
   console.log("¡Supabase conectado!", supabase);
   // =================================
 

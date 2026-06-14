@@ -28,6 +28,7 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
   <style>
     :root { --safe-b: env(safe-area-inset-bottom, 0px); --safe-t: env(safe-area-inset-top, 0px); }
@@ -200,30 +201,32 @@ function buildCashflow(saldoInicial, pagos, cobros, semanas = 8) {
 /* ===========================================================================
    MÓDULO db  — IndexedDB. Única capa que tocaría Supabase en Fase 2.
    =========================================================================== */
-const db = (() => {
-  const DB_NAME = "obras_db";
-  const DB_VERSION = 2;
-  const STORES = ["proyectos","partidas","movimientos","proveedores","categorias","cuentas","pagos_programados","carpetas","clientes","cobros_programados","adjuntos"];
-  let _db = null;
+/* ============================================================================
+   CONFIG SUPABASE  ←  PEGA AQUÍ TUS DOS DATOS
+   =========================================================================== */
+const SUPABASE_URL = "PEGA_AQUI_TU_PROJECT_URL";        // ej: https://abcd1234.supabase.co
+const SUPABASE_ANON_KEY = "PEGA_AQUI_TU_ANON_PUBLIC_KEY"; // la "anon public" (NUNCA la service_role)
+const SB_READY = SUPABASE_URL.indexOf("PEGA_AQUI") === -1 && typeof supabase !== "undefined";
+const sb = (typeof supabase !== "undefined")
+  ? supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false } })
+  : null;
+let CURRENT_EMAIL = "";
+function session_email() { return CURRENT_EMAIL; }
 
-  function open() {
-    return new Promise((resolve, reject) => {
-      const r = indexedDB.open(DB_NAME, DB_VERSION);
-      r.onupgradeneeded = (e) => {
-        const d = e.target.result;
-        STORES.forEach((s) => { if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: "id" }); });
-      };
-      r.onsuccess = () => { _db = r.result; resolve(_db); };
-      r.onerror = () => reject(r.error);
-    });
-  }
-  const reqP = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-  async function store(name, mode) { const d = _db || (await open()); return d.transaction(name, mode).objectStore(name); }
-  async function _all(s) { return reqP((await store(s, "readonly")).getAll()); }
-  async function _put(s, o) { await reqP((await store(s, "readwrite")).put(o)); return o; }
-  async function _del(s, id) { await reqP((await store(s, "readwrite")).delete(id)); return id; }
-  async function _bulk(s, arr) { const os = await store(s, "readwrite"); for (const o of arr) await reqP(os.put(o)); }
-  async function _clearAll() { for (const s of STORES) { const os = await store(s, "readwrite"); await reqP(os.clear()); } }
+/* ============================================================================
+   MÓDULO db — ahora habla con Supabase (Postgres + RLS).
+   Mismos nombres de métodos que la versión IndexedDB: la UI no cambia.
+   =========================================================================== */
+const db = (() => {
+  const TABLES = ["proyectos","partidas","movimientos","proveedores","categorias","cuentas","pagos_programados","carpetas","clientes","cobros_programados","adjuntos"];
+  function open() { return Promise.resolve(); }
+
+  async function _all(t) { const { data, error } = await sb.from(t).select("*"); if (error) throw error; return data || []; }
+  async function _insert(t, o) { const c = { ...o }; delete c.user_id; const { data, error } = await sb.from(t).insert(c).select().single(); if (error) throw error; return data; }
+  async function _update(t, o) { const c = { ...o }; delete c.user_id; const { data, error } = await sb.from(t).update(c).eq("id", o.id).select().single(); if (error) throw error; return data; }
+  async function _del(t, id) { const { error } = await sb.from(t).delete().eq("id", id); if (error) throw error; return id; }
+  async function _clear(t) { const { error } = await sb.from(t).delete().neq("id", "__none__"); if (error) throw error; }
+  async function _bulk(t, arr) { if (!arr || !arr.length) return; const clean = arr.map((o) => { const c = { ...o }; delete c.user_id; return c; }); const { error } = await sb.from(t).insert(clean); if (error) throw error; }
 
   // ---- Catálogos base (se conservan; arrancan disponibles aunque la app esté en cero) ----
   function buildCatalogs() {
@@ -311,44 +314,33 @@ const db = (() => {
     return { carpetas, clientes, proyectos, partidas, movimientos: mov, pagos_programados, cobros_programados };
   }
 
-  // Solo siembra catálogos si no existen. NUNCA crea obras/movimientos por su cuenta.
   async function ensureSeed() {
     const cats = await _all("categorias");
     if (cats.length === 0) { const c = buildCatalogs(); for (const k of Object.keys(c)) await _bulk(k, c[k]); }
   }
-  // Deja la app EN CERO: borra obras, partidas, movimientos, pagos, cobros, carpetas, clientes y adjuntos.
-  // Conserva catálogos: cuentas, categorías y proveedores.
   async function resetZero() {
-    for (const s of ["proyectos","partidas","movimientos","pagos_programados","cobros_programados","carpetas","clientes","adjuntos"]) {
-      const os = await store(s, "readwrite"); await reqP(os.clear());
-    }
+    for (const t of ["proyectos","partidas","movimientos","pagos_programados","cobros_programados","carpetas","clientes","adjuntos"]) await _clear(t);
     await ensureSeed();
   }
-  // Carga los datos DEMO encima de los catálogos.
   async function loadExample() {
     await resetZero();
     const e = buildExample();
     for (const k of Object.keys(e)) await _bulk(k, e[k]);
   }
-  async function wipe() { await _clearAll(); }
+  async function wipe() { for (const t of TABLES) await _clear(t); }
 
-  // ---- Respaldo / restauración (paracaídas hasta Supabase) ----
   async function exportAll() {
-    const out = { __app: "obras", __version: DB_VERSION, __exported: new Date().toISOString(), data: {} };
-    for (const s of STORES) out.data[s] = await _all(s);
+    const out = { __app: "obras", __version: 2, __exported: new Date().toISOString(), data: {} };
+    for (const t of TABLES) out.data[t] = await _all(t);
     return out;
   }
   async function importAll(obj) {
     if (!obj || !obj.data) throw new Error("Archivo de respaldo inválido");
-    await _clearAll();
-    for (const s of STORES) { if (Array.isArray(obj.data[s])) await _bulk(s, obj.data[s]); }
+    for (const t of TABLES) await _clear(t);
+    for (const t of TABLES) { if (Array.isArray(obj.data[t])) await _bulk(t, obj.data[t]); }
     await ensureSeed();
   }
 
-  // -------- API pública por entidad (async; aquí entraría Supabase) --------
-  // Ejemplo Fase 2:
-  //   getMovimientos: async () => (await supabase.from('movimientos').select('*')).data
-  //   addMovimiento:  async (m) => (await supabase.from('movimientos').insert(m).select().single()).data
   const nameMap = {
     Movimientos: "movimientos", Proveedores: "proveedores", Proyectos: "proyectos",
     Categorias: "categorias", Cuentas: "cuentas", Partidas: "partidas", PagosProgramados: "pagos_programados",
@@ -361,14 +353,13 @@ const db = (() => {
   };
   const api = {};
   Object.keys(nameMap).forEach((N) => {
-    const store = nameMap[N];
+    const t = nameMap[N];
     const S = singular[N];
-    api[`get${N}`] = () => _all(store);
-    api[`add${S}`] = (o) => _put(store, Object.assign({ id: uid(store.slice(0, 3)) }, o));
-    api[`update${S}`] = (o) => _put(store, o);
-    api[`delete${S}`] = (id) => _del(store, id);
+    api[`get${N}`] = () => _all(t);
+    api[`add${S}`] = (o) => _insert(t, Object.assign({ id: uid(t.slice(0, 3)) }, o));
+    api[`update${S}`] = (o) => _update(t, o);
+    api[`delete${S}`] = (id) => _del(t, id);
   });
-  // Adjuntos de un movimiento (carga perezosa, no entran en el reload general)
   api.getAdjuntosByMov = async (movId) => (await _all("adjuntos")).filter((a) => a.movimiento_id === movId);
 
   return Object.assign(api, { open, ensureSeed, resetZero, loadExample, wipe, exportAll, importAll });
@@ -535,6 +526,58 @@ function ChartBox({ type, data, options, height = 220, onPick }) {
   return <div style={{ height }}><canvas ref={ref} /></div>;
 }
 
+/* ----------------------- Config faltante / Login -------------------------- */
+function ConfigNeeded() {
+  return (
+    <div className="min-h-screen grid place-items-center px-8 text-center" style={{ paddingTop: "var(--safe-t)" }}>
+      <div>
+        <div className="text-4xl mb-3">🔌</div>
+        <p className="font-semibold mb-2">Falta conectar Supabase</p>
+        <p className="text-sm text-zinc-500">Abre <span className="font-mono">index.html</span> y pega tu <b>Project URL</b> y tu <b>anon public key</b> en las primeras líneas (constantes <span className="font-mono">SUPABASE_URL</span> y <span className="font-mono">SUPABASE_ANON_KEY</span>).</p>
+      </div>
+    </div>
+  );
+}
+
+function Login({ dark }) {
+  const [email, setEmail] = useState("");
+  const [pass, setPass] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const entrar = async () => {
+    setBusy(true); setMsg("");
+    const { error } = await sb.auth.signInWithPassword({ email: email.trim(), password: pass });
+    if (error) setMsg(error.message);
+    setBusy(false);
+  };
+  const crear = async () => {
+    if (!email.trim() || pass.length < 6) { setMsg("Email válido y contraseña de 6+ caracteres."); return; }
+    setBusy(true); setMsg("");
+    const { error } = await sb.auth.signUp({ email: email.trim(), password: pass });
+    if (error) setMsg(error.message);
+    else setMsg("Cuenta creada. Si no entra solo, toca Entrar.");
+    setBusy(false);
+  };
+  return (
+    <div className="min-h-screen grid place-items-center px-8" style={{ paddingTop: "var(--safe-t)" }}>
+      <div className="w-full max-w-xs text-center">
+        <div className="text-4xl mb-2">🏗️</div>
+        <p className="text-xl font-bold mb-1">Obras</p>
+        <p className="text-sm text-zinc-500 mb-6">Entra para sincronizar tus datos.</p>
+        <div className="space-y-3 text-left">
+          <Field label="Email"><TextInput type="email" inputMode="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="tu@correo.com" /></Field>
+          <Field label="Contraseña"><TextInput type="password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder="••••••" /></Field>
+        </div>
+        {msg && <p className="text-xs text-amber-600 dark:text-amber-400 my-3">{msg}</p>}
+        <div className="space-y-2 mt-4">
+          <Btn onClick={entrar} className={busy ? "opacity-60" : ""}>{busy ? "…" : "Entrar"}</Btn>
+          <Btn variant="ghost" onClick={crear}>Crear cuenta</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ============================================================================
    APP
    =========================================================================== */
@@ -562,7 +605,22 @@ function App() {
     setData({ movimientos, proyectos, partidas, proveedores, categorias, cuentas, pagos_programados, carpetas, clientes, cobros_programados });
   }, []);
 
-  useEffect(() => { (async () => { await db.open(); await db.ensureSeed(); await reload(); setLoading(false); })(); }, [reload]);
+  const [session, setSession] = useState(undefined); // undefined = verificando, null = sin sesión
+  useEffect(() => {
+    if (!SB_READY) { setLoading(false); return; }
+    sb.auth.getSession().then(({ data }) => { CURRENT_EMAIL = (data.session && data.session.user && data.session.user.email) || ""; setSession(data.session || null); });
+    const { data: sub } = sb.auth.onAuthStateChange((_e, s) => { CURRENT_EMAIL = (s && s.user && s.user.email) || ""; setSession(s || null); });
+    return () => { try { sub.subscription.unsubscribe(); } catch {} };
+  }, []);
+  useEffect(() => {
+    (async () => {
+      if (!SB_READY || session === undefined) return;
+      if (!session) { setLoading(false); return; }
+      setLoading(true);
+      try { await db.ensureSeed(); await reload(); } catch (e) { console.error(e); showToast("Error cargando datos. Revisa tu conexión."); }
+      setLoading(false);
+    })();
+  }, [session, reload]);
   useEffect(() => { document.documentElement.classList.toggle("dark", dark); try { localStorage.setItem("obras_dark", dark ? "1" : "0"); } catch {} }, [dark]);
   useEffect(() => { const h = () => setUpdateReady(true); window.addEventListener("sw-update", h); return () => window.removeEventListener("sw-update", h); }, []);
 
@@ -622,7 +680,9 @@ function App() {
     await reload(); showToast("Cobro registrado e ingreso generado");
   };
 
+  if (!SB_READY) return <ConfigNeeded />;
   if (loading) return <div className="min-h-screen grid place-items-center text-zinc-400"><div className="text-center"><div className="text-3xl mb-2 animate-pulse">$</div>Cargando…</div></div>;
+  if (!session) return <Login dark={dark} />;
 
   if (locked && pin) return <PinLock pin={pin} dark={dark} onUnlock={() => setLocked(false)} />;
 
@@ -1840,7 +1900,15 @@ function Mas({ ctx, dark, setDark }) {
           <button onClick={async () => { if (confirm("Borrar TODO, incluso catálogos?")) { await db.wipe(); await db.ensureSeed(); await reload(); showToast("Todo borrado"); } }} className="text-sm text-rose-600 dark:text-rose-400 block">Borrar todo</button>
         </Card>
 
-        <p className="text-xs text-zinc-400 text-center pt-2">Obras · Fase 1 · Datos guardados en tu dispositivo.</p>
+        <Card className="p-4 flex items-center justify-between">
+          <div>
+            <p className="font-medium">Sesión</p>
+            <p className="text-xs text-zinc-500">{(sb && sb.auth && session_email()) || "Conectado"}</p>
+          </div>
+          <button onClick={async () => { if (confirm("¿Cerrar sesión?")) { try { await sb.auth.signOut(); } catch {} } }} className="text-sm text-rose-600 dark:text-rose-400 font-medium">Cerrar sesión</button>
+        </Card>
+
+        <p className="text-xs text-zinc-400 text-center pt-2">Obras · Fase 2 (Supabase) · Sincronizado en la nube.</p>
       </div>
       {pinSheet && <PinSheet pin={pin} setPin={setPin} showToast={showToast} onClose={() => setPinSheet(false)} />}
     </div>
@@ -1990,48 +2058,6 @@ if ("serviceWorker" in navigator) {
     }).catch(() => {});
   });
 }
-    // ... Todo el código de "registrar SW" que ya tienes ...
-    });
-  }
-
-  // === AQUÍ PEGAS LO DE SUPABASE ===
-  const SUPABASE_URL = 'https://tu-proyecto.supabase.co'; 
-  const SUPABASE_ANON_KEY = 'tu-clave-anon-super-larga...';
-  const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-    async function guardarEnAdministracion() {
-  // 1. Jalamos los datos que escribiste en la pantalla
-  const conceptoForm = document.getElementById('concepto').value;
-  const montoForm = document.getElementById('monto').value;
-
-  // Validación rápida para que no envíes cosas vacías
-  if (!conceptoForm || !montoForm) {
-    alert('Por favor, llena todos los campos');
-    return;
-  }
-
-  // 2. Mandamos los datos a Supabase
-  const { data, error } = await supabase
-    .from('administracion') // Así se debe llamar tu tabla en Supabase
-    .insert([
-      { concepto: conceptoForm, monto: parseFloat(montoForm) }
-    ]);
-
-  if (error) {
-    alert('Hubo un error al guardar: ' + error.message);
-  } else {
-    alert('¡Registro administrativo guardado con éxito!');
-    // Limpiamos los campos
-    document.getElementById('concepto').value = '';
-    document.getElementById('monto').value = '';
-  }
-}
-  console.log("¡Supabase conectado!", supabase);
-  // =================================
-
-</script>
-</body>
-</html>
-
   </script>
 </body>
 </html>

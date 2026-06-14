@@ -1990,6 +1990,22 @@ if ("serviceWorker" in navigator) {
     }).catch(() => {});
   });
 }
+    // ... Todo el código de "registrar SW" que ya tienes ...
+    });
+  }
+
+  // === AQUÍ PEGAS LO DE SUPABASE ===
+  const SUPABASE_URL = 'https://tu-proyecto.supabase.co'; 
+  const SUPABASE_ANON_KEY = 'tu-clave-anon-super-larga...';
+  const supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  console.log("¡Supabase conectado!", supabase);
+  // =================================
+
+</script>
+</body>
+</html>
+
   </script>
 </body>
 </html>
